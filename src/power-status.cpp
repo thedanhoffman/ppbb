@@ -351,6 +351,16 @@ static const PerfLimitBits PERF_LIMIT_REASONS[] = {
     {"", 0}  // sentinel
 };
 
+// Perf limit event tracking (accumulated across refresh cycles)
+struct PerfEventStats {
+    int count = 0;
+    int total_ms = 0;
+    bool active = false;
+};
+static PerfEventStats g_pl_stats[16]; // indexed by bit number (0-15)
+static unsigned int g_prev_pkg_current = 0;
+static auto g_start_time = std::chrono::steady_clock::now();
+
 // ── Thermal throttle sysfs reader ──
 
 struct ThrottleStats {
@@ -668,6 +678,17 @@ static void refresh() {
         // Also read LOG-only sticky MSR (0x6B1) - shows different history
         unsigned long long pkg_sticky = read_msr(0, 0x6B1);
 
+        // Update accumulated perf limit event stats
+        unsigned int interval_ms = 5000;
+        unsigned int newly_active = pkg_current & ~g_prev_pkg_current;
+        for (int b = 0; b < 16; ++b) {
+            unsigned int m = 1u << b;
+            if (newly_active & m) g_pl_stats[b].count++;
+            g_pl_stats[b].active = (pkg_current & m) != 0;
+            if (pkg_current & m) g_pl_stats[b].total_ms += interval_ms;
+        }
+        g_prev_pkg_current = pkg_current;
+
         std::cout << "   Package:" << std::endl;
         std::cout << "     raw 0x6B0: " << color(WHT, hex(pkg_reasons, 16)) << std::endl;
         std::cout << "     raw 0x6B1: " << color(WHT, hex(pkg_sticky, 16)) << std::endl;
@@ -750,6 +771,39 @@ static void refresh() {
             }
         } else {
             std::cout << "   Throttle:   " << color(BLK, "N/A") << std::endl;
+        }
+    }
+
+    // 2b. Accumulated perf limit event stats (since tool start)
+    if (msr_ok) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - g_start_time).count();
+        bool any_events = false;
+        for (int b = 0; b < 16; ++b) {
+            if (g_pl_stats[b].count > 0 || g_pl_stats[b].total_ms > 0) {
+                any_events = true;
+                break;
+            }
+        }
+        if (any_events) {
+            std::cout << "   Events (" << elapsed << "s uptime):" << std::endl;
+            for (int b = 0; b < 16; ++b) {
+                auto& s = g_pl_stats[b];
+                if (s.count == 0 && s.total_ms == 0) continue;
+                // Find name for this bit
+                std::string name = "bit" + std::to_string(b);
+                for (int i = 0; PERF_LIMIT_REASONS[i].name[0]; ++i) {
+                    if (PERF_LIMIT_REASONS[i].bit == (unsigned)b) {
+                        name = PERF_LIMIT_REASONS[i].name;
+                        break;
+                    }
+                }
+                std::string active_flag = s.active ? color(RED, " 🔴") : "";
+                std::cout << "     " << name << ":" << active_flag
+                          << "  " << s.count << " event" << (s.count == 1 ? "" : "s")
+                          << "  (" << s.total_ms << "ms)"
+                          << std::endl;
+            }
         }
     }
 
