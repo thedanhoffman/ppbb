@@ -1,0 +1,19 @@
+[Unit]
+Description=CPU/GPU Power Balancer
+Documentation=man:power-balance(1)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/power-balance
+Restart=on-failure
+RestartSec=5
+Nice=-10
+# Requires read/write access to MSR and RAPL sysfs
+CapabilityBoundingSet=CAP_SYS_RAWIO
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
