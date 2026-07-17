@@ -6,10 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(power-balance src/power-balance.cpp)
-
 target_compile_options(power-balance PRIVATE -Wall -Wextra)
 
-install(TARGETS power-balance DESTINATION bin)
+add_executable(power-status src/power-status.cpp)
+target_compile_options(power-status PRIVATE -Wall -Wextra)
+
+install(TARGETS power-balance power-status DESTINATION bin)
 
 install(FILES systemd/power-balance.service
   DESTINATION lib/systemd/system
