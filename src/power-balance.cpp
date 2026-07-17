@@ -1,6 +1,6 @@
 // power-balance.cpp — CPU/GPU power balancer daemon
-// Dynamically limits CPU (PP0) power to stay within package TDP
-// when GPU (uncore) power draw is high.
+// Dynamically limits CPU (PP0) and GPU (uncore) power to stay within
+// a fraction of the configured package PL1.
 // Compile: g++ -std=c++17 -O2 power-balance.cpp -o power-balance
 
 #include <algorithm>
@@ -19,11 +19,13 @@
 #include <syslog.h>
 
 // ── Configuration ──
-static constexpr double PACKAGE_TDP_W = 28.0;
-static constexpr int    INTERVAL_MS  = 500;
-static constexpr double MARGIN_W     = 2.0;
-static constexpr double MIN_CPU_W    = 5.0;
-static constexpr double SMOOTH_ALPHA = 0.3;
+static constexpr double DEFAULT_PACKAGE_TDP_W = 28.0;
+static constexpr double DEFAULT_RATIO         = 0.80;
+static constexpr int    INTERVAL_MS           = 500;
+static constexpr double MARGIN_W              = 2.0;
+static constexpr double MIN_CORE_W            = 5.0;
+static constexpr double MIN_UNCORE_W          = 0.0;
+static constexpr double SMOOTH_ALPHA          = 0.3;
 
 // ── Sysfs helpers ──
 
@@ -53,8 +55,8 @@ static bool read_attr(const std::string& dir, const std::string& name, T& out) {
 }
 
 // ── RAPL paths ──
-static const std::string PKG_DIR  = "/sys/class/powercap/intel-rapl/intel-rapl:0";
-static const std::string CORE_DIR = PKG_DIR + "/intel-rapl:0:0";
+static const std::string PKG_DIR    = "/sys/class/powercap/intel-rapl/intel-rapl:0";
+static const std::string CORE_DIR   = PKG_DIR + "/intel-rapl:0:0";
 static const std::string UNCORE_DIR = PKG_DIR + "/intel-rapl:0:1";
 
 // ── Sampling ──
@@ -74,7 +76,6 @@ static double compute_power_w(const Sample& prev, const Sample& cur) {
     if (prev.energy_uj < 0 || cur.energy_uj < 0) return 0;
     long long delta_uj = cur.energy_uj - prev.energy_uj;
     if (delta_uj < 0) {
-        // energy counter wrapped — skip this sample
         return -1;
     }
     auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(cur.time - prev.time).count();
@@ -82,21 +83,46 @@ static double compute_power_w(const Sample& prev, const Sample& cur) {
     return (double)delta_uj / delta_us;
 }
 
+static double read_package_pl1_w() {
+    long long uw = 0;
+    if (read_attr(PKG_DIR, "constraint_0_power_limit_uw", uw) && uw > 0)
+        return uw / 1e6;
+    return DEFAULT_PACKAGE_TDP_W;
+}
+
+static double round_to_125mw(double watts) {
+    if (watts < 0) return 0;
+    return std::round(watts / 0.125) * 0.125;
+}
+
 // ── State ──
 static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int) { g_running = 0; }
 
 int main(int argc, char** argv) {
-    // Parse optional --tdp argument
-    double tdp = PACKAGE_TDP_W;
-    if (argc >= 3 && strcmp(argv[1], "--tdp") == 0) {
-        tdp = std::stod(argv[2]);
-        if (tdp < 1) tdp = PACKAGE_TDP_W;
+    double tdp   = DEFAULT_PACKAGE_TDP_W;
+    double ratio = DEFAULT_RATIO;
+    bool tdp_explicit = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (i + 1 < argc && strcmp(argv[i], "--tdp") == 0) {
+            tdp = std::stod(argv[++i]);
+            if (tdp < 1) tdp = DEFAULT_PACKAGE_TDP_W;
+            tdp_explicit = true;
+        } else if (i + 1 < argc && strcmp(argv[i], "--ratio") == 0) {
+            ratio = std::stod(argv[++i]);
+            if (ratio <= 0.0 || ratio > 1.0) ratio = DEFAULT_RATIO;
+        }
+    }
+
+    if (!tdp_explicit) {
+        double sysfs_tdp = read_package_pl1_w();
+        if (sysfs_tdp > 0) tdp = sysfs_tdp;
     }
 
     openlog("power-balance", LOG_PID | LOG_CONS, LOG_DAEMON);
-    syslog(LOG_INFO, "starting — package TDP: %.1fW, margin: %.1fW, interval: %dms",
-           tdp, MARGIN_W, INTERVAL_MS);
+    syslog(LOG_INFO, "starting — package PL1: %.1fW  ratio: %.2f  margin: %.1fW  interval: %dms",
+           tdp, ratio, MARGIN_W, INTERVAL_MS);
 
     // Check RAPL paths exist
     if (read_file(PKG_DIR + "/name").empty() ||
@@ -107,8 +133,9 @@ int main(int argc, char** argv) {
     }
 
     // Enable RAPL domains
-    write_file(PKG_DIR + "/enabled", "1");
-    write_file(CORE_DIR + "/enabled", "1");
+    write_file(PKG_DIR + "/enabled",      "1");
+    write_file(CORE_DIR + "/enabled",     "1");
+    write_file(UNCORE_DIR + "/enabled",   "1");
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
@@ -148,28 +175,40 @@ int main(int argc, char** argv) {
         // Exponential smoothing on GPU power
         smoothed_gpu_w = SMOOTH_ALPHA * gpu_w + (1.0 - SMOOTH_ALPHA) * smoothed_gpu_w;
 
-        // Budget for CPU = TDP - GPU - margin
-        double cpu_budget = tdp - smoothed_gpu_w - MARGIN_W;
-        cpu_budget = std::max(cpu_budget, MIN_CPU_W);
-        cpu_budget = std::min(cpu_budget, tdp);
+        // Total budget for core + uncore = ratio × package PL1
+        double total_budget = tdp * ratio;
+
+        // Uncore gets its current draw plus margin, but not so much
+        // that core would fall below its minimum.
+        double uncore_limit = smoothed_gpu_w + MARGIN_W;
+        uncore_limit = std::clamp(uncore_limit, MIN_UNCORE_W, total_budget - MIN_CORE_W);
+
+        // Core gets the remainder
+        double core_limit = total_budget - uncore_limit;
+        core_limit = std::max(core_limit, MIN_CORE_W);
 
         // Round to nearest 0.125W (RAPL register granularity)
-        long long pp0_uw = (long long)std::round(cpu_budget * 1e6 / 125000.0) * 125000;
-        if (pp0_uw < 0) pp0_uw = 0;
+        double core_limit_r   = round_to_125mw(core_limit);
+        double uncore_limit_r = round_to_125mw(uncore_limit);
 
-        // Write PP0 limit via sysfs
-        write_file(CORE_DIR + "/constraint_0_power_limit_uw", std::to_string(pp0_uw));
+        // Write both limits via sysfs (kernel expects microwatts)
+        write_file(CORE_DIR + "/constraint_0_power_limit_uw",
+                   std::to_string((long long)(core_limit_r * 1e6)));
         write_file(CORE_DIR + "/constraint_0_time_window_us", "976");
+        write_file(UNCORE_DIR + "/constraint_0_power_limit_uw",
+                   std::to_string((long long)(uncore_limit_r * 1e6)));
+        write_file(UNCORE_DIR + "/constraint_0_time_window_us", "976");
 
         if (iterations % 20 == 0) {
-            syslog(LOG_INFO, "pkg=%.1fW  core=%.1fW  gpu=%.1fW  gpu_sm=%.1fW  cpu_budget=%.1fW  pp0=%llduW",
-                   pkg_w, core_w, gpu_w, smoothed_gpu_w, cpu_budget, pp0_uw);
+            syslog(LOG_INFO, "pkg=%.1fW  core=%.1fW  gpu=%.1fW  gpu_sm=%.1fW  budget=%.1fW  core_lmt=%.3fW  uncore_lmt=%.3fW",
+                   pkg_w, core_w, gpu_w, smoothed_gpu_w, total_budget, core_limit_r, uncore_limit_r);
         }
     }
 
-    // Reset PP0 limit on exit
-    write_file(CORE_DIR + "/constraint_0_power_limit_uw", "0");
-    syslog(LOG_INFO, "stopped — PP0 limit reset to 0 (disabled)");
+    // Reset limits on exit
+    write_file(CORE_DIR + "/constraint_0_power_limit_uw",   "0");
+    write_file(UNCORE_DIR + "/constraint_0_power_limit_uw", "0");
+    syslog(LOG_INFO, "stopped — PP0 and uncore limits reset to 0 (disabled)");
     closelog();
     return 0;
 }
