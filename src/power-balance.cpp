@@ -226,7 +226,7 @@ static void discover_topology() {
     int global_max = 0;
     for (int cpu = 0; cpu < 256; ++cpu) {
         int mf = 0;
-        if (!read_attr("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq", "cpuinfo_max_freq", mf)) break;
+        if (!read_attr("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq", "cpuinfo_max_freq", mf)) continue;
         if (mf > global_max) global_max = mf;
     }
     int threshold = (int)(global_max * 0.9);
@@ -237,11 +237,15 @@ static void discover_topology() {
         g.cpus = kv.second;
         std::sort(g.cpus.begin(), g.cpus.end());
         g.has_ht = g.cpus.size() > 1;
-        // Check first CPU's max_freq for P/E classification
-        int mf = 0;
-        std::string cpufreq_dir = "/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/cpufreq";
-        read_attr(cpufreq_dir, "cpuinfo_max_freq", mf);
-        g.is_pcore = (mf >= threshold && mf > 0);
+        // P/E classification: primary = has_ht (P-cores have HT on Meteor Lake).
+        // Fallback = check cpuinfo_max_freq when cpufreq is available.
+        g.is_pcore = g.has_ht;
+        if (!g.is_pcore) {
+            int mf = 0;
+            std::string cpufreq_dir = "/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/cpufreq";
+            if (read_attr(cpufreq_dir, "cpuinfo_max_freq", mf))
+                g.is_pcore = (mf >= threshold);
+        }
         // Priority: E-cores first, then higher CPU-numbered P-cores
         g.priority = g.is_pcore ? g.cpus[0] : (1000 + g.cpus[0]);
         g.saved_online = true;
