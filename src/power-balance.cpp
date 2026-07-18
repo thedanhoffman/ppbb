@@ -561,6 +561,48 @@ static void track_perf_limits(PerfLimitCounters* pl, int cpu) {
     pl->prev_current = current;
 }
 
+// ── Charger health ──
+// Detect insufficient charger conditions that cause EC PROCHOT assertion.
+static std::string check_charger_health() {
+    bool ac_online = false;
+    std::string note;
+
+    DIR* dir = opendir("/sys/class/power_supply");
+    if (!dir) return "";
+    struct dirent* de;
+    while ((de = readdir(dir)) != nullptr) {
+        std::string name = de->d_name;
+        if (name == "." || name == "..") continue;
+        std::string base = "/sys/class/power_supply/" + name;
+        std::string type = read_file(base + "/type");
+        if (type.empty()) continue;
+
+        if (type.find("Mains") != std::string::npos) {
+            if (read_file(base + "/online") == "1") ac_online = true;
+        } else if (type.find("BAT") != std::string::npos) {
+            std::string st = read_file(base + "/status");
+            if (ac_online && (st == "Discharging" || st == "Not charging")) {
+                note = "insufficient charger: battery " + st;
+            }
+        } else if (type.find("USB") != std::string::npos) {
+            if (read_file(base + "/online") == "1") {
+                long long cur_max = 0, vol_max = 0;
+                read_attr(base, "current_max", cur_max);
+                read_attr(base, "voltage_max", vol_max);
+                if (vol_max > 0 && cur_max > 0) {
+                    double max_w = (double)vol_max * cur_max / 1e12;
+                    if (max_w > 0 && max_w < 45.0) {
+                        if (!note.empty()) note += "; ";
+                        note += std::to_string((int)max_w) + "W USB-C charger";
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
+    return note;
+}
+
 // ── Temperature ──
 static std::string CORETEMP_DIR;  // coretemp hwmon directory
 
@@ -933,14 +975,23 @@ int main(int argc, char** argv) {
             }
             // Build CPU MSR perf limit summary (currently active reasons)
             std::string cpu_thr;
+            static int prochot_warn_cycle = 0;
             if (msr_ok) {
                 unsigned long long msr = read_msr(0, 0x6B0);
                 unsigned int current = msr & 0xFFFF;
                 for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
-                    if (i == 0) continue;  // PROCHOT — external signal we disabled via MSR 0x1FC
+                    if (i == 0) continue;  // PROCHOT handled separately below
                     if (current & (1u << PERF_LIMIT_REASONS[i].bit)) {
                         if (!cpu_thr.empty()) cpu_thr += " ";
                         cpu_thr += PERF_LIMIT_REASONS[i].name;
+                    }
+                }
+                // PROCHOT active — check for root cause and warn if charger weak
+                if (current & 1) {
+                    std::string chg = check_charger_health();
+                    if (!chg.empty() && iterations - prochot_warn_cycle > 120) {
+                        syslog(LOG_WARNING, "PROCHOT asserted — %s", chg.c_str());
+                        prochot_warn_cycle = iterations;
                     }
                 }
             }
