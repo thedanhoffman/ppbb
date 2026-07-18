@@ -25,11 +25,17 @@
 // ── Configuration ──
 static constexpr double   DEFAULT_PL1_W        = 40.0;
 static constexpr int      INTERVAL_MS          = 500;
-// Residency-based thresholds (TODO #1 done):
-// GPU c0_residency_ms is read each cycle → c0_pct (0.0–1.0)
-//   c0_pct >= 0.70 → aggression 2 (disable turbo)
-//   c0_pct >= 0.30 → aggression 1 (throttle EPP)
-// GPU_ACTIVE_W / GPU_HEAVY_W remain as fallback for platforms without C0 residency sysfs.
+// GPU activity thresholds (TODO #1 done):
+// Primary: C0 residency → c0_pct (0.0–1.0) over each 500ms window
+//   c0_pct >= 0.70 → aggression 2 (disable turbo, hard power cap)
+//   c0_pct >= 0.30 → aggression 1 (throttle EPP, cap max_perf)
+//   c0_pct  <  0.30 → aggression 0 (idle — all cores online, full turbo)
+// Fallback (platforms without C0 residency sysfs):
+//   GPU_ACTIVE_W  (3 W)  → aggression 1 (throttle EPP)
+//   GPU_HEAVY_W (15 W)  → aggression 2 (disable turbo)
+// When residency is available, GPU_HEAVY_W is only used for max_perf
+// scaling (proportional load) — it no longer drives aggression or
+// no-turbo as an independent threshold.
 //
 // GT1 power minimization (TODO #3 done):
 //   GT0 (graphics) gets normal profiles (base, power_saving) via set_gt0_profile()
@@ -126,6 +132,7 @@ struct GpuState {
     // C0 residency-based GPU activity tracking (TODO #1)
     // Replaces hardcoded GPU_ACTIVE_W/GPU_HEAVY_W thresholds with
     // residency percentage, which is much more portable across GPUs.
+    bool        has_c0_residency = false;  // true when c0_residency_path is populated
     std::string c0_residency_path; // gt0/activity/c0_residency_ms
     long long   last_c0_residency_us = 0; // microseconds, last read value
     long long   _last_c0_time_us = 0;     // steady_clock time of last read (internal)
@@ -330,8 +337,10 @@ static void discover_gpu(SystemState& s) {
         s.gpu.idle_path = base0 + "/gtidle/idle_status";
         // C0 residency path for activity-based thresholds (TODO #1)
         std::string c0_path = base0 + "/activity/c0_residency_ms";
-        if (read_file(c0_path) != "")
+        if (read_file(c0_path) != "") {
             s.gpu.c0_residency_path = c0_path;
+            s.gpu.has_c0_residency = true;
+        }
         std::string base1 = "/sys/class/drm/" + card + "/device/tile0/gt1";
         if (read_file(base1 + "/freq0/cur_freq") != "") s.gpu.gt1 = base1;
         break;
@@ -578,7 +587,7 @@ static void discover_topology(CpuState& c) {
 
 // Target logical CPUs to keep online based on aggression + temperature.
 // Returns the number of CoreGroups to keep online.
-static int compute_keep_groups(int aggression, double temp_c, double gpu_w, bool weak_charger = false) {
+static int compute_keep_groups(int aggression, double temp_c, double /*gpu_w*/, bool weak_charger = false) {
     // If charger is weak, cap aggressively
     if (weak_charger) return 2;
     // idle/cool:  all groups online
@@ -590,8 +599,9 @@ static int compute_keep_groups(int aggression, double temp_c, double gpu_w, bool
     // throttle:   temp 85-90°C or throttling → 3 P + 1 E = 4 groups (7 threads)
     if (temp_c >= 85.0) return 4;
 
-    // heavy:      temp 80-85°C or GPU > 15W → 6 P + 2 E = 8 groups (14 threads)
-    if (aggression >= 1 || temp_c >= 80.0 || gpu_w > GPU_HEAVY_W) return 8;
+    // heavy:      temp 80-85°C or GPU active (via residency or agg level)
+    //             → 6 P + 2 E = 8 groups (14 threads)
+    if (aggression >= 1 || temp_c >= 80.0) return 8;
 
     // moderate:   temp 70-80°C or GPU active → 6 P + 6 E = 12 groups (18 threads)
     return 12;
@@ -1237,12 +1247,19 @@ int main(int argc, char** argv) {
         clear_prochot_msr(msr_ok);
 
         // ── CPU frequency capping ──
-        // Combine aggression-based cap with thermal cap (most conservative wins)
+        // Combine aggression-based cap with thermal cap (most conservative wins).
+        // When C0 residency is available, GPU_HEAVY_W is used only as a fallback
+        // for max_perf scaling (proportional to actual power).  Without residency,
+        // it drives the aggression level directly (wattage-threshold model).
         int max_perf = 100;
         if (aggression >= 2) {
             max_perf = (int)CRITICAL_MAX_PERF;
         } else if (aggression >= 1) {
-            double ratio = std::min(smoothed_gpu_w / GPU_HEAVY_W, 1.0);
+            double gpu_load_w = smoothed_gpu_w;
+            // If residency is available, scale max_perf by actual GPU power.
+            // If residency is absent, GPU_HEAVY_W was already used in compute_aggression()
+            // to raise agg→1, so we apply the same proportional cap for smooth transition.
+            double ratio = std::min(gpu_load_w / GPU_HEAVY_W, 1.0);
             max_perf = 100 - (int)(ratio * (100.0 - ACTIVE_MAX_PERF));
             max_perf = std::max(max_perf, (int)ACTIVE_MAX_PERF);
         }
@@ -1250,8 +1267,11 @@ int main(int argc, char** argv) {
         write_int(PSTATE_MAX, max_perf);
 
         // ── CPU turbo control ──
+        // No-turbo is driven by aggression level (which comes from residency
+        // when available, or wattage threshold when residency is absent).
+        // GPU_HEAVY_W no longer acts as an independent hard cutoff.
         int no_turbo = 0;
-        if (aggression >= 2 || smoothed_gpu_w > GPU_HEAVY_W) no_turbo = 1;
+        if (aggression >= 2) no_turbo = 1;
         no_turbo = std::max(no_turbo, thermal.no_turbo);
         write_int(PSTATE_NOTURBO, no_turbo);
 
