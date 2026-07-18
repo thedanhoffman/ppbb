@@ -112,7 +112,7 @@ static const char* temp_color(int celsius) {
 struct Battery {
     std::string name, status, health, model, manufacturer, technology;
     int capacity = 0;
-    int cycle_count = 0;
+    int cycle_count = -1;
     int charge_now_mA = -1;
     int charge_full_mA = -1;
     int charge_full_design_mA = -1;
@@ -594,9 +594,12 @@ static void refresh() {
         std::cout << "   Status:  " << color(status_color(battery.status), battery.status)
                   << status_warn << std::endl;
         std::cout << "   Level:   " << color(WHT, std::to_string(battery.capacity) + "%") << std::endl;
-        std::cout << "   Health:  " << color(WHT, battery.health) << std::endl;
-        std::cout << "   Cycle:   " << color(WHT, std::to_string(battery.cycle_count)) << std::endl;
-        std::cout << "   Temp:    " << color(WHT, std::to_string(battery.temp_C) + "°C") << std::endl;
+        if (!battery.health.empty())
+            std::cout << "   Health:  " << color(WHT, battery.health) << std::endl;
+        if (battery.cycle_count >= 0)
+            std::cout << "   Cycle:   " << color(WHT, std::to_string(battery.cycle_count)) << std::endl;
+        if (battery.temp_C >= 0)
+            std::cout << "   Temp:    " << color(WHT, std::to_string(battery.temp_C) + "°C") << std::endl;
 
         std::string charge_str;
         if (battery.charge_now_mA >= 0 && battery.charge_full_mA >= 0) {
