@@ -988,7 +988,7 @@ static void refresh() {
                     track_gpu_throttle(throttle_state, throttle_dir);
                 first_throttle = false;
 
-                std::string throttle_line = "     throttle: ";
+                std::string throttle_line = "     hw-throttle: ";
                 if (throttling) {
                     throttle_line += color(RED, "active");
                 } else if (throttle_state.total_events > 0) {

@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
         if (aggression != last_aggression || iterations % 20 == 0) {
             const char* state = "idle";
             if (aggression == 1) state = "active";
-            if (aggression == 2) state = "THROTTLE";
+            if (aggression == 2) state = "balance-throttle";
             // Build throttle event summary
             std::string throttle_summary;
             if (have_gpu && gpu_tc.total_events > 0) {
@@ -796,7 +796,7 @@ int main(int argc, char** argv) {
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
                    pl1_w, core_limit_r, max_perf, no_turbo, epp_str.c_str(),
                    temp_buf,
-                   throttle_summary.empty() ? "" : "  throttle: ",
+                   throttle_summary.empty() ? "" : "  hw-throttle: ",
                    throttle_summary.c_str());
             last_aggression = aggression;
         }
@@ -811,10 +811,10 @@ int main(int argc, char** argv) {
                 summary += std::string(THROTTLE_REASONS[i]) + "=" + std::to_string(gpu_tc.events[i]);
             }
         }
-        syslog(LOG_INFO, "GPU throttle events: %d total (%s)  cycles_throttled=%d",
+        syslog(LOG_INFO, "hardware throttle events: %d total (%s)  cycles_throttled=%d",
                gpu_tc.total_events, summary.c_str(), gpu_tc.cycles_throttled);
     } else if (have_gpu) {
-        syslog(LOG_INFO, "GPU throttle events: none — no throttling occurred during this session");
+        syslog(LOG_INFO, "hardware throttle events: none — no hardware throttling occurred during this session");
     }
 
     // ── Restore everything on exit ──
