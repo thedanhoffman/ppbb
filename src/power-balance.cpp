@@ -302,7 +302,7 @@ static int count_online_groups() {
 // Returns the number of CoreGroups to keep online.
 static int compute_keep_groups(int aggression, double temp_c, double gpu_w, bool weak_charger = false) {
     // If charger is weak, cap aggressively
-    if (weak_charger) return 4;
+    if (weak_charger) return 2;
     // idle/cool:  all groups online
     if (aggression <= 0 && temp_c < 70.0) return (int)g_core_groups.size();
 
@@ -622,6 +622,8 @@ static ChargerInfo check_charger() {
 
 // ── Temperature ──
 static std::string CORETEMP_DIR;  // coretemp hwmon directory
+static std::string POWERCLAMP_DEV;  // intel_powerclamp cooling device path
+static int g_saved_powerclamp_state = 0;
 
 static void discover_coretemp() {
     DIR* hwmon = opendir("/sys/class/hwmon");
@@ -637,6 +639,21 @@ static void discover_coretemp() {
         }
     }
     closedir(hwmon);
+    // Discover intel_powerclamp
+    DIR* therm = opendir("/sys/class/thermal");
+    if (!therm) return;
+    while ((entry = readdir(therm)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.find("cooling_device") != 0) continue;
+        std::string path = std::string("/sys/class/thermal/") + name;
+        if (read_file(path + "/type") == "intel_powerclamp") {
+            POWERCLAMP_DEV = path;
+            read_attr(POWERCLAMP_DEV, "cur_state", g_saved_powerclamp_state);
+            syslog(LOG_INFO, "intel_powerclamp=%s (saved state=%d)", path.c_str(), g_saved_powerclamp_state);
+            break;
+        }
+    }
+    closedir(therm);
 }
 
 static double read_max_core_temp() {
@@ -999,14 +1016,21 @@ int main(int argc, char** argv) {
         // ── Weak charger constraints ──
         // Apply aggressive power saving when the charger can't keep up.
         // These are applied AFTER all normal controls so they always win.
-        // On transition out of weak charger mode, restore GPU freq and uncore.
+        // On transition out of weak charger mode, restore GPU freq, profile, uncore, powerclamp.
         static bool g_gpu_freq_capped = false;
         double effective_pl1_w = pl1_w;
         if (weak_charger && g_charger_max_watts > 0) {
-            if (!g_gpu_freq_capped) g_gpu_freq_capped = true;
+            if (!g_gpu_freq_capped) {
+                g_gpu_freq_capped = true;
+                // Switch GPU profile to power_saving on entry
+                set_gpu_profile("power_saving");
+                // Set intel_powerclamp to 20% idle injection
+                if (!POWERCLAMP_DEV.empty())
+                    write_int(POWERCLAMP_DEV + "/cur_state", 20);
+            }
 
-            // Lower package PL1 to ~70% of charger capacity
-            double weak_pl1 = g_charger_max_watts * 0.7;
+            // Lower package PL1 to ~50% of charger capacity
+            double weak_pl1 = g_charger_max_watts * 0.5;
             if (weak_pl1 < pl1_w) {
                 effective_pl1_w = weak_pl1;
                 write_int(PKG_DIR + "/constraint_0_power_limit_uw", (long long)(weak_pl1 * 1e6));
@@ -1024,22 +1048,26 @@ int main(int argc, char** argv) {
             no_turbo = 1;
             write_int(PSTATE_NOTURBO, no_turbo);
 
-            max_perf = std::min(max_perf, 40);
+            max_perf = std::min(max_perf, 20);
             write_int(PSTATE_MAX, max_perf);
 
             write_int(PSTATE_MIN, 0);
 
-            if (!GPU_GT0.empty()) write_int(GPU_GT0 + "/freq0/max_freq", 900);
-            if (!GPU_GT1.empty()) write_int(GPU_GT1 + "/freq0/max_freq", 600);
+            if (!GPU_GT0.empty()) write_int(GPU_GT0 + "/freq0/max_freq", 800);
+            if (!GPU_GT1.empty()) write_int(GPU_GT1 + "/freq0/max_freq", 100);
 
             if (have_uncore)
                 write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", (long long)(3.0 * 1e6));
         } else if (g_gpu_freq_capped) {
             g_gpu_freq_capped = false;
+            // Restore GPU to base profile, freq, uncore, and powerclamp
+            set_gpu_profile("base");
             if (g_saved_gt0_max_freq > 0) write_int(GPU_GT0 + "/freq0/max_freq", g_saved_gt0_max_freq);
             if (g_saved_gt1_max_freq > 0) write_int(GPU_GT1 + "/freq0/max_freq", g_saved_gt1_max_freq);
             if (have_uncore)
                 write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
+            if (!POWERCLAMP_DEV.empty())
+                write_int(POWERCLAMP_DEV + "/cur_state", g_saved_powerclamp_state);
         }
 
         // ── Log state changes ──
@@ -1132,6 +1160,7 @@ int main(int argc, char** argv) {
     // ── Restore everything on exit ──
     if (have_core)   write_int(CORE_DIR + "/constraint_0_power_limit_uw", 0);
     if (have_uncore) write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
+    if (!POWERCLAMP_DEV.empty()) write_int(POWERCLAMP_DEV + "/cur_state", g_saved_powerclamp_state);
     restore_online_state();
     restore_cpu_state();
 

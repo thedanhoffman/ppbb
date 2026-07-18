@@ -135,14 +135,16 @@ The power-save mode applies every available control simultaneously:
 
 | Control | Setting |
 |---------|---------|
-| Package PL1 | Lowered to ~70% of charger capacity (e.g., 10.5 W for a 15 W USB-C charger) |
+| Package PL1 | Lowered to ~50% of charger capacity (e.g., 7.5 W for a 15 W USB-C charger) |
 | Turbo | Forced off (`no_turbo=1`) |
-| `max_perf_pct` | Capped to 40% |
+| `max_perf_pct` | Capped to 20% |
 | EPP (all cores) | Forced to `power` |
 | `min_perf_pct` | Forced to 0 for deepest idle states |
-| GPU `max_freq` | gt0 capped to 900 MHz, gt1 capped to 600 MHz |
+| GPU `max_freq` | gt0 capped to 800 MHz, gt1 capped to 100 MHz |
+| GPU power profile | Switched to `power_saving` |
 | Uncore (PP1) budget | Capped to 3 W (instead of unlimited) |
-| CPU hotplug | Keep only 4 core groups (~8 threads) |
+| CPU hotplug | Keep only 2 core groups (~4 threads) |
+| `intel_powerclamp` | 20% forced idle injection at package level |
 
 The charger is checked every 10 seconds.  When an adequate charger is
 detected (e.g., switching from USB-C to the barrel connector), all controls
@@ -151,7 +153,7 @@ are restored to their normal aggression/temperature-derived values.
 The `[power-save]` state is displayed in the log state tag:
 
 ```
-[power-save] pkg=3.6W core=1.2W gpu=0.1W(gpu_sm=0.1W) pl1=10.5W core_lmt=8.4W max_perf=40% no_turbo=1 epp=power  temp=49C  gpu-throttle: prochot:1
+[power-save] pkg=3.6W core=0.9W gpu=0.1W(gpu_sm=0.1W) pl1=7.5W core_lmt=5.4W max_perf=20% no_turbo=1 epp=power  temp=51C  gpu-throttle: prochot:1
 ```
 
 A transition message is logged on entry and exit:
