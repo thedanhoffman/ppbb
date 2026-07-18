@@ -429,20 +429,24 @@ static const std::string PSTATE_MIN    = PSTATE_DIR + "/min_perf_pct";
 static const std::string PSTATE_NOTURBO = PSTATE_DIR + "/no_turbo";
 
 // ── EPP management ──
+// Track last-set values per-cluster to avoid redundant sysfs writes.
+// Static variables survive between calls — only log when values genuinely change.
+static std::string last_epp_p = "";
+static std::string last_epp_e = "";
+
 static void cpu_set_epp(CpuState& c, const std::string& p_val, const std::string& e_val) {
-    // Duplicated writes are harmless but noisy — only write when changed.
-    // We track "current" in caller state (not in CpuState) to avoid
-    // needing a separate global.
-    std::string p = read_file(c.pcore_epp_paths.empty() ? "" : c.pcore_epp_paths[0]);
-    std::string e = read_file(c.ecore_epp_paths.empty() ? "" : c.ecore_epp_paths[0]);
-    if (p_val == p && e_val == e) return;
+    if (c.pcore_epp_paths.empty() && c.ecore_epp_paths.empty()) return;
+
+    bool changed = (p_val != last_epp_p) || (e_val != last_epp_e);
+    if (!changed) return;
+
+    last_epp_p = p_val;
+    last_epp_e = e_val;
 
     for (auto& p : c.pcore_epp_paths) write_str(p, p_val);
     for (auto& p : c.ecore_epp_paths) write_str(p, e_val);
 
-    std::string msg = "EPP -> P:" + p_val;
-    if (e_val != p_val) msg += "  E:" + e_val;
-    syslog(LOG_INFO, "%s", msg.c_str());
+    syslog(LOG_INFO, "EPP -> P:%s  E:%s", p_val.c_str(), e_val.c_str());
 }
 
 static void cpu_set_epp_all(const CpuState& c, const std::string& val) {
@@ -1039,6 +1043,26 @@ int main(int argc, char** argv) {
     }
 
     openlog("power-balance", LOG_PID | LOG_CONS, LOG_DAEMON);
+
+    // ── Conflict check ──
+    // Warn if other daemons that also manage CPU power are running.
+    // Our daemon needs exclusive control over PSTATE, EPP, RAPL, and hotplug.
+    {
+        auto service_active = [](const char* name) -> bool {
+            int fd[2] = {-1, -1};
+            if (pipe(fd) != 0) return false;
+            int ret = -1;
+            // Use systemd-run to check status without blocking on output
+            std::string cmd = std::string("systemctl is-active --quiet ") + name;
+            ret = system(cmd.c_str());
+            close(fd[0]); close(fd[1]);
+            return (ret == 0);  // systemctl returns 0 when active
+        };
+        if (service_active("power-profiles-daemon"))
+            syslog(LOG_WARNING, "CONFLICT: power-profiles-daemon is running — it fights over EPP/pstate/sysfs");
+        if (service_active("thermald"))
+            syslog(LOG_WARNING, "CONFLICT: thermald is running — it competes for thermal/cooler control");
+    }
 
     SystemState s;
 
