@@ -85,6 +85,22 @@ static int read_temp(const std::string& dir) {
 
 static int safe_celsius(int raw) { return raw >= 0 ? raw : -1; }
 
+static int detect_cpu_count() {
+    DIR* dir = opendir("/sys/devices/system/cpu");
+    if (!dir) return 8;
+    int count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strncmp(entry->d_name, "cpu", 3) == 0) {
+            char* end = nullptr;
+            long n = strtol(entry->d_name + 3, &end, 10);
+            if (*end == '\0' && n >= 0) count++;
+        }
+    }
+    closedir(dir);
+    return count > 0 ? count : 8;
+}
+
 static const char* temp_color(int celsius) {
     if (celsius < 0)      return BLK;
     if (celsius < 60)     return GRN;
@@ -152,89 +168,87 @@ static int read_cpu_pkg_temp() {
     return -1;
 }
 
-static std::map<std::string, int> read_cpu_core_temps() {
-    std::map<std::string, int> cores;
-    DIR* dir = opendir("/sys/devices/platform/coretemp.0/hwmon");
-    if (!dir) return cores;
+static std::string find_coretemp_hwmon() {
+    DIR* dir = opendir("/sys/class/hwmon");
+    if (!dir) return "";
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
-        std::string hwmon = entry->d_name;
-        if (hwmon[0] == '.') continue;
-        std::string hwmon_dir = "/sys/devices/platform/coretemp.0/hwmon/" + hwmon;
-        DIR* subdir = opendir(hwmon_dir.c_str());
-        if (!subdir) continue;
-        struct dirent* fe;
-        while ((fe = readdir(subdir)) != nullptr) {
-            std::string fname = fe->d_name;
-            if (fname.size() < 12) continue;
-            if (fname.substr(0, 4) != "temp" || fname.substr(5, 1) < "0" || fname.substr(5, 1) > "9") continue;
-            if (fname.substr(6) != "_input") continue;
-
-            std::string full = hwmon_dir + "/" + fname;
-            std::string label_path = full + "_label";
-
-            std::string val = read_file(full);
-            if (val.empty()) continue;
-
-            int raw = 0;
-            if (!(std::istringstream(val) >> raw)) continue;
-            int celsius = raw / 1000;
-
-            std::string label = read_file(label_path);
-            if (label.empty()) label = "Core ?";
-            cores[label] = celsius;
+        std::string name = entry->d_name;
+        if (name[0] == '.') continue;
+        std::string driver = read_file("/sys/class/hwmon/" + name + "/name");
+        if (driver == "coretemp") {
+            closedir(dir);
+            return "/sys/class/hwmon/" + name;
         }
-        closedir(subdir);
     }
     closedir(dir);
+    return "";
+}
+
+static std::map<std::string, int> read_cpu_core_temps() {
+    std::map<std::string, int> cores;
+    std::string hwmon_dir = find_coretemp_hwmon();
+    if (hwmon_dir.empty()) return cores;
+
+    DIR* subdir = opendir(hwmon_dir.c_str());
+    if (!subdir) return cores;
+    struct dirent* fe;
+    while ((fe = readdir(subdir)) != nullptr) {
+        std::string fname = fe->d_name;
+        if (fname.size() < 11) continue;
+        if (fname.substr(0, 4) != "temp") continue;
+        size_t us = fname.find("_input", 4);
+        if (us == std::string::npos || us < 5) continue;
+
+        std::string full = hwmon_dir + "/" + fname;
+
+        std::string val = read_file(full);
+        if (val.empty()) continue;
+
+        int raw = 0;
+        if (!(std::istringstream(val) >> raw)) continue;
+        int celsius = raw / 1000;
+
+        std::string num_part = fname.substr(4, us - 4);
+        std::string label_path = hwmon_dir + "/temp" + num_part + "_label";
+            std::string label = read_file(label_path);
+            if (label.empty()) continue;
+            // Skip the package-level temp entry (e.g. "Package id 0")
+            if (label.find("Package") != std::string::npos) continue;
+            cores[label] = celsius;
+    }
+    closedir(subdir);
     return cores;
 }
 
 static int read_gpu_temp() {
-    DIR* card_dir = opendir("/sys/class/drm/card0/device/hwmon");
-    if (card_dir) {
-        struct dirent* entry;
-        while ((entry = readdir(card_dir)) != nullptr) {
-            std::string hwmon = entry->d_name;
+    DIR* drm_dir = opendir("/sys/class/drm");
+    if (!drm_dir) return -1;
+    struct dirent* entry;
+    while ((entry = readdir(drm_dir)) != nullptr) {
+        std::string card = entry->d_name;
+        if (card.find("card") != 0) continue;
+        std::string hwmon_base = "/sys/class/drm/" + card + "/device/hwmon";
+        DIR* hdir = opendir(hwmon_base.c_str());
+        if (!hdir) continue;
+        struct dirent* hentry;
+        while ((hentry = readdir(hdir)) != nullptr) {
+            std::string hwmon = hentry->d_name;
             if (hwmon[0] == '.') continue;
-            std::string name = read_file("/sys/class/drm/card0/device/hwmon/" + hwmon + "/name");
-            if (name.find("i915") != std::string::npos) {
+            std::string hname = read_file(hwmon_base + "/" + hwmon + "/name");
+            if (hname.find("i915") != std::string::npos ||
+                hname.find("amdgpu") != std::string::npos) {
                 int t;
-                if (read_attr("/sys/class/drm/card0/device/hwmon/" + hwmon, "temp1_input", t)) {
-                    closedir(card_dir);
+                if (read_attr(hwmon_base + "/" + hwmon, "temp1_input", t)) {
+                    closedir(drm_dir);
+                    closedir(hdir);
                     return safe_celsius(t / 1000);
                 }
             }
         }
-        closedir(card_dir);
+        closedir(hdir);
     }
-    DIR* amd_dir = opendir("/sys/class/drm");
-    if (amd_dir) {
-        struct dirent* entry;
-        while ((entry = readdir(amd_dir)) != nullptr) {
-            std::string card = entry->d_name;
-            if (card.find("card") != 0) continue;
-            std::string path = "/sys/class/drm/" + card + "/device/hwmon";
-            DIR* hdir = opendir(path.c_str());
-            if (!hdir) continue;
-            struct dirent* hentry;
-            while ((hentry = readdir(hdir)) != nullptr) {
-                std::string hwmon = hentry->d_name;
-                if (hwmon[0] == '.') continue;
-                std::string hname = read_file(path + "/" + hwmon + "/name");
-                if (hname.find("amdgpu") != std::string::npos) {
-                    int t;
-                    if (read_attr(path + "/" + hwmon, "temp1_input", t)) {
-                        closedir(amd_dir);
-                        closedir(hdir);
-                        return safe_celsius(t / 1000);
-                    }
-                }
-            }
-            closedir(hdir);
-        }
-        closedir(amd_dir);
-    }
+    closedir(drm_dir);
     return -1;
 }
 
@@ -388,6 +402,7 @@ static ThrottleStats read_throttle_stats(int cpu) {
 
 struct RAPLDomain {
     std::string name;
+    std::string base_path;
     long long power_uw = -1;
     long long energy_uj = -1;
     long long pl1_uw = -1;
@@ -398,38 +413,49 @@ struct RAPLDomain {
     long long pl4_uw = -1;
 };
 
-static std::vector<RAPLDomain> read_rapl_domains() {
-    std::vector<RAPLDomain> domains;
-    DIR* dir = opendir("/sys/class/powercap/intel-rapl");
-    if (!dir) return domains;
+static void scan_rapl_domains_in(const std::string& dir_path, std::vector<RAPLDomain>& domains) {
+    DIR* dir = opendir(dir_path.c_str());
+    if (!dir) return;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
         if (name[0] == '.') continue;
-        if (name.find("intel-rapl:") != 0) continue;
-        // skip subdomains (e.g. intel-rapl:0:0)
-        if (std::count(name.begin(), name.end(), ':') > 1) continue;
 
-        std::string base = "/sys/class/powercap/intel-rapl/" + name;
-        std::string rname = read_file(base + "/name");
+        // Only recurse into actual RAPL domain directories (have ":" in name)
+        // This avoids following symlinks like "device" or "subsystem"
+        if (name.find(':') == std::string::npos) continue;
+
+        std::string full = dir_path + "/" + name;
+
+        std::string rname = read_file(full + "/name");
         if (rname.empty()) continue;
 
         RAPLDomain d;
         d.name = rname;
+        d.base_path = full;
         long long tmp;
-        if (read_attr(base, "power_uw", tmp)) d.power_uw = tmp;
-        if (read_attr(base, "energy_uj", tmp)) d.energy_uj = tmp;
+        if (read_attr(full, "power_uw", tmp)) d.power_uw = tmp;
+        if (read_attr(full, "energy_uj", tmp)) d.energy_uj = tmp;
 
-        if (read_attr(base, "constraint_0_power_limit_uw", tmp)) d.pl1_uw = tmp;
-        if (read_attr(base, "constraint_0_time_window_us", tmp)) d.pl1_window_us = tmp;
-        if (read_attr(base, "constraint_0_max_power_uw", tmp)) d.pl1_max_uw = tmp;
-        if (read_attr(base, "constraint_1_power_limit_uw", tmp)) d.pl2_uw = tmp;
-        if (read_attr(base, "constraint_1_time_window_us", tmp)) d.pl2_window_us = tmp;
-        if (read_attr(base, "constraint_2_power_limit_uw", tmp)) d.pl4_uw = tmp;
+        if (read_attr(full, "constraint_0_power_limit_uw", tmp)) d.pl1_uw = tmp;
+        if (read_attr(full, "constraint_0_time_window_us", tmp)) d.pl1_window_us = tmp;
+        if (read_attr(full, "constraint_0_max_power_uw", tmp)) d.pl1_max_uw = tmp;
+        if (read_attr(full, "constraint_1_power_limit_uw", tmp)) d.pl2_uw = tmp;
+        if (read_attr(full, "constraint_1_time_window_us", tmp)) d.pl2_window_us = tmp;
+        if (read_attr(full, "constraint_2_power_limit_uw", tmp)) d.pl4_uw = tmp;
 
         domains.push_back(d);
+
+        // Recurse into subdomains (entries with two ":" separators, e.g., intel-rapl:0:0)
+        scan_rapl_domains_in(full, domains);
     }
     closedir(dir);
+}
+
+static std::vector<RAPLDomain> read_rapl_domains() {
+    std::vector<RAPLDomain> domains;
+    scan_rapl_domains_in("/sys/class/powercap/intel-rapl", domains);
+    scan_rapl_domains_in("/sys/class/powercap/intel-rapl-mmio", domains);
     return domains;
 }
 
@@ -470,6 +496,7 @@ static RAPLState g_pkg_rapl;  // tracks package-0 energy
 // ── Main ──
 
 static void refresh() {
+    int cpu_count = detect_cpu_count();
     std::cout << "\033[H\033[2J";
     std::cout << "\033[?25l";
     std::cout << color(CYN, "══════════════════════════════════════════════════════════") << std::endl;
@@ -714,7 +741,7 @@ static void refresh() {
 
         // Check each core for active throttling
         bool any_core = false;
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < cpu_count; ++c) {
             unsigned long long cv = read_msr(c, 0x690);
             if (cv) {
                 if (!any_core) {
@@ -748,7 +775,7 @@ static void refresh() {
         int max_pkg_total = 0;
         bool any_data = false;
 
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < cpu_count; ++c) {
             auto t = read_throttle_stats(c);
             if (t.core_count >= 0) any_data = true;
             total_core_count += t.core_count;
@@ -760,7 +787,7 @@ static void refresh() {
 
         if (any_data) {
             std::cout << "   Throttle events:" << std::endl;
-            for (int c = 0; c < 8; ++c) {
+            for (int c = 0; c < cpu_count; ++c) {
                 auto t = read_throttle_stats(c);
                 if (t.core_count > 0 || t.pkg_count > 0) {
                     std::cout << "     CPU" << c << ": core=" << t.core_count
@@ -833,7 +860,13 @@ static void refresh() {
 
         if (!domains.empty()) {
             std::cout << "   Power:" << std::endl;
+            bool pkg0_shown = false;
             for (auto& d : domains) {
+                // Deduplicate package-0 (may appear from both intel-rapl and intel-rapl-mmio)
+                if (d.name == "package-0") {
+                    if (pkg0_shown) continue;
+                    pkg0_shown = true;
+                }
                 std::string line = "     " + d.name;
                 // Determine effective PL1 — max_constraint is the real hw floor
                 long long pl1_effective = d.pl1_uw;
@@ -870,32 +903,47 @@ static void refresh() {
 
     // ── GPU metrics (Xe driver) ──
     {
-        std::string gt_freq = "/sys/class/drm/card1/device/tile0/gt0/freq0";
-        std::string gt_idle = "/sys/class/drm/card1/device/tile0/gt0/gtidle";
-        bool has_gpu = read_file(gt_freq + "/cur_freq") != "";
+        // Find any card with a tile0/gt0/freq0 directory (Xe driver)
+        std::string xe_freq_base;
+        DIR* drm_xe = opendir("/sys/class/drm");
+        if (drm_xe) {
+            struct dirent* de;
+            while ((de = readdir(drm_xe)) != nullptr) {
+                std::string card = de->d_name;
+                if (card.find("card") != 0) continue;
+                std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
+                if (read_file(candidate + "/cur_freq") != "") {
+                    xe_freq_base = candidate;
+                    break;
+                }
+            }
+            closedir(drm_xe);
+        }
 
+        bool has_gpu = !xe_freq_base.empty();
         if (has_gpu) {
+            std::string gt_idle = xe_freq_base.substr(0, xe_freq_base.rfind('/')) + "/gtidle";
             std::cout << "   GPU:" << std::endl;
 
             // Frequencies
             int cur, actual, max_f, rp0, rpe, rpn;
             std::string line = "     freq:";
-            if (read_attr(gt_freq, "cur_freq", cur))
+            if (read_attr(xe_freq_base, "cur_freq", cur))
                 line += " cur " + std::to_string(cur) + " MHz";
-            if (read_attr(gt_freq, "act_freq", actual))
+            if (read_attr(xe_freq_base, "act_freq", actual))
                 line += " act " + std::to_string(actual) + " MHz";
-            if (read_attr(gt_freq, "max_freq", max_f))
+            if (read_attr(xe_freq_base, "max_freq", max_f))
                 line += " max " + std::to_string(max_f) + " MHz";
-            if (read_attr(gt_freq, "rp0_freq", rp0))
+            if (read_attr(xe_freq_base, "rp0_freq", rp0))
                 line += " turbo " + std::to_string(rp0) + " MHz";
-            if (read_attr(gt_freq, "rpe_freq", rpe))
+            if (read_attr(xe_freq_base, "rpe_freq", rpe))
                 line += " eff " + std::to_string(rpe) + " MHz";
-            if (read_attr(gt_freq, "rpn_freq", rpn))
+            if (read_attr(xe_freq_base, "rpn_freq", rpn))
                 line += " min " + std::to_string(rpn) + " MHz";
             std::cout << line << std::endl;
 
             // Throttle
-            std::string throttle = read_file(gt_freq + "/throttle");
+            std::string throttle = read_file(xe_freq_base + "/throttle");
             if (!throttle.empty()) {
                 std::cout << "     throttle: " << color(RED, throttle) << std::endl;
             } else {
@@ -903,9 +951,8 @@ static void refresh() {
             }
 
             // Power profile
-            std::string profile = read_file(gt_freq + "/power_profile");
+            std::string profile = read_file(xe_freq_base + "/power_profile");
             if (!profile.empty()) {
-                // format: "[base]    power_saving" — brackets mark the active profile
                 std::string active;
                 size_t bs = profile.find('[');
                 size_t be = profile.find(']');
@@ -937,8 +984,20 @@ static void refresh() {
                 static std::chrono::steady_clock::time_point prev_uncore_time;
                 static bool first_uncore = true;
 
+                // Find uncore RAPL subdomain dynamically
+                auto uncore_domains = read_rapl_domains();
+                std::string uncore_path;
+                for (auto& r : uncore_domains) {
+                    if (r.name == "uncore") { uncore_path = r.base_path; break; }
+                }
+
                 long long ue = -1;
-                read_attr("/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1", "energy_uj", ue);
+                if (!uncore_path.empty())
+                    read_attr(uncore_path, "energy_uj", ue);
+                if (ue < 0) {
+                    // Fallback: direct path for intel-rapl:0:1
+                    read_attr("/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1", "energy_uj", ue);
+                }
                 if (ue >= 0) {
                     auto now = std::chrono::steady_clock::now();
                     if (!first_uncore && prev_uncore_energy >= 0) {
@@ -1034,7 +1093,7 @@ static void refresh() {
     // Check sysfs throttle counts accumulated since last boot
     {
         int worst_core = 0, worst_pkg = 0;
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < cpu_count; ++c) {
             auto t = read_throttle_stats(c);
             if (t.core_count > worst_core) worst_core = t.core_count;
             if (t.pkg_count > worst_pkg) worst_pkg = t.pkg_count;
@@ -1052,7 +1111,13 @@ static void refresh() {
         bool msr_locked = (msr610 >> 63) & 1;
         bool pl1_clamp = (msr610 >> 16) & 1;
         long long pl1_max = 0;
-        read_attr("/sys/class/powercap/intel-rapl/intel-rapl:0", "constraint_0_max_power_uw", pl1_max);
+        // Find first package-0 domain for PL1 max cap info
+        for (auto& rd : read_rapl_domains()) {
+            if (rd.name == "package-0" && rd.pl1_max_uw > 0) {
+                pl1_max = rd.pl1_max_uw;
+                break;
+            }
+        }
 
         std::cout << std::endl;
         std::cout << color(YEL, "🔧  Tuning") << std::endl;
@@ -1066,10 +1131,26 @@ static void refresh() {
             if (pl1_clamp) {
                 std::cout << "   PL1 clamp: " << color(YEL, "enabled") << " — CPU will throttle below min freq if limit exceeded" << std::endl;
             }
-            // Check GPU max_freq writability
+            // Check GPU max_freq writability — find Xe GT0 freq0 path dynamically
             int gpu_max = 0, gpu_rp0 = 0;
-            if (read_attr("/sys/class/drm/card1/device/tile0/gt0/freq0", "max_freq", gpu_max) &&
-                read_attr("/sys/class/drm/card1/device/tile0/gt0/freq0", "rp0_freq", gpu_rp0)) {
+            std::string gpu_freq_path;
+            DIR* drm_tune = opendir("/sys/class/drm");
+            if (drm_tune) {
+                struct dirent* de;
+                while ((de = readdir(drm_tune)) != nullptr) {
+                    std::string card = de->d_name;
+                    if (card.find("card") != 0) continue;
+                    std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
+                    if (read_file(candidate + "/cur_freq") != "") {
+                        gpu_freq_path = candidate;
+                        break;
+                    }
+                }
+                closedir(drm_tune);
+            }
+            if (!gpu_freq_path.empty() &&
+                read_attr(gpu_freq_path, "max_freq", gpu_max) &&
+                read_attr(gpu_freq_path, "rp0_freq", gpu_rp0)) {
                 std::string gpu_tune = "   GPU freq:  max=" + std::to_string(gpu_max) + " MHz  turbo cap=" + std::to_string(gpu_rp0) + " MHz";
                 if (gpu_max < gpu_rp0) gpu_tune += color(YEL, " (apply_max_performance() via forcewake can unlock)");
                 std::cout << gpu_tune << std::endl;
