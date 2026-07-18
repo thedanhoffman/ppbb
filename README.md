@@ -92,6 +92,39 @@ currently active CPU throttle reasons as `cpu-throttle:` in the periodic log
 line (e.g., `cpu-throttle: Core/Cache` when PP0 core budget is capped).
 Rising-edge events are accumulated per reason and reported on exit.
 
+PROCHOT (bit 0) is excluded from the `cpu-throttle:` line and from
+aggregation — see PROCHOT handling below.
+
+### PROCHOT handling
+
+Many laptop ECs assert the PROCHOT# signal aggressively, even at low
+temperatures and idle power.  On this Acer Meteor Lake platform the EC
+asserts PROCHOT# at ~44°C / 4 W due to an insufficient charger (see below).
+
+The daemon disables the CPU's response to external PROCHOT# by clearing
+MSR 0x1FC bit 0 every cycle.  The EC/firmware continuously re-enables this
+bit, so a one-time clear at startup is not sufficient — the daemon must
+rewrite it each cycle.  The original MSR value is saved on startup and
+restored on exit.
+
+When PROCHOT# assertion is detected in MSR 0x6B0, the daemon checks the
+power supply subsystem for signs of an inadequate charger:
+
+- Battery **Discharging** or **Not charging** while AC is online
+- USB-C Power Delivery contract below 45 W
+
+If a weak or insufficient charger is identified, a `LOG_WARNING` is emitted
+(ratelimited to once per ~60 s):
+
+```
+PROCHOT asserted — insufficient charger: battery Not charging; 15W USB-C charger
+```
+
+This gives the user a direct, actionable diagnostic instead of silently
+tolerating performance loss from a power-limited charge source.  The daemon
+continues to clear the PROCHOT# response regardless, so normal operation
+is unaffected while the warning is displayed.
+
 ### CPU controls
 
 | Control | Mechanism | Notes |
@@ -189,6 +222,14 @@ Logs are available via `journalctl -u power-balance`.
   core_lmt=8.0W max_perf=20% no_turbo=1 epp=power(balance_power)  temp=85C  
   gpu-throttle: pl4:4  cpu-throttle: Core/Cache
 ```
+
+```
+PROCHOT asserted — insufficient charger: battery Not charging; 15W USB-C charger
+```
+
+PROCHOT warnings are emitted at `LOG_WARNING` priority when the daemon
+detects external PROCHOT# assertion from an inadequate charger.  This is a
+one-time ratelimited diagnostic — it does not appear in every periodic line.
 
 Periodic log lines (every 20 iterations = 10 s) include power readings,
 applied limits, temperature, GPU throttle event counts (`gpu-throttle:`),
