@@ -318,6 +318,36 @@ static volatile sig_atomic_t g_running = 1;
 
 static void handle_signal(int) { g_running = 0; }
 
+// ── GPU throttle event tracking (Xe driver reason_* files) ──
+
+static const char* XE_THROTTLE_REASONS[] = {
+    "pl1", "pl2", "pl4", "prochot", "thermal", "ratl", "vr_tdc", "vr_thermalert", nullptr
+};
+static const char* XE_THROTTLE_FILES[] = {
+    "reason_pl1", "reason_pl2", "reason_pl4",
+    "reason_prochot", "reason_thermal", "reason_ratl",
+    "reason_vr_tdc", "reason_vr_thermalert", nullptr
+};
+
+struct GpuThrottleState {
+    int events[8] = {0};
+    int total_events = 0;
+    bool prev_active[8] = {false};
+};
+
+static void track_gpu_throttle(GpuThrottleState& state, const std::string& throttle_dir) {
+    for (int i = 0; XE_THROTTLE_FILES[i]; ++i) {
+        int v = 0;
+        read_attr(throttle_dir, XE_THROTTLE_FILES[i], v);
+        bool active = (v != 0);
+        if (active && !state.prev_active[i]) {
+            state.events[i]++;
+            state.total_events++;
+        }
+        state.prev_active[i] = active;
+    }
+}
+
 // ── MSR reading (Perf Limit Reasons) ──
 
 static bool msr_available() {
@@ -942,12 +972,40 @@ static void refresh() {
                 line += " min " + std::to_string(rpn) + " MHz";
             std::cout << line << std::endl;
 
-            // Throttle
-            std::string throttle = read_file(xe_freq_base + "/throttle");
-            if (!throttle.empty()) {
-                std::cout << "     throttle: " << color(RED, throttle) << std::endl;
-            } else {
-                std::cout << "     throttle: " << color(GRN, "none") << std::endl;
+            // Throttle status (combined flag + individual reason tracking)
+            {
+                static GpuThrottleState throttle_state;
+                static bool first_throttle = true;
+
+                std::string throttle_dir = xe_freq_base + "/throttle";
+                std::string status = read_file(throttle_dir + "/status");
+                bool throttling = (status == "1");
+
+                if (!first_throttle)
+                    track_gpu_throttle(throttle_state, throttle_dir);
+                first_throttle = false;
+
+                std::string throttle_line = "     throttle: ";
+                if (throttling) {
+                    throttle_line += color(RED, "active");
+                } else if (throttle_state.total_events > 0) {
+                    throttle_line += color(YEL, "history (" + std::to_string(throttle_state.total_events) + " events)");
+                } else {
+                    throttle_line += color(GRN, "none");
+                }
+                if (throttle_state.total_events > 0) {
+                    throttle_line += "  [";
+                    bool first_reason = true;
+                    for (int i = 0; XE_THROTTLE_REASONS[i]; ++i) {
+                        if (throttle_state.events[i] > 0) {
+                            if (!first_reason) throttle_line += " ";
+                            throttle_line += std::string(XE_THROTTLE_REASONS[i]) + ":" + std::to_string(throttle_state.events[i]);
+                            first_reason = false;
+                        }
+                    }
+                    throttle_line += "]";
+                }
+                std::cout << throttle_line << std::endl;
             }
 
             // Power profile

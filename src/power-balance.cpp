@@ -138,33 +138,84 @@ static const std::string PSTATE_MAX    = PSTATE_DIR + "/max_perf_pct";
 static const std::string PSTATE_MIN    = PSTATE_DIR + "/min_perf_pct";
 static const std::string PSTATE_NOTURBO = PSTATE_DIR + "/no_turbo";
 
+// ── Per-cluster EPP paths ──
+// On hybrid Intel (Meteor Lake+), P-cores and E-cores have different
+// max frequencies.  We group them so P-cores get aggressively throttled
+// first while E-cores stay more responsive for background tasks.
+static std::vector<std::string> g_pcore_epp_paths;
+static std::vector<std::string> g_ecore_epp_paths;
+
+static void discover_clusters() {
+    int global_max_freq = 0;
+    std::vector<std::pair<std::string, int>> cpus;
+
+    DIR* dir = opendir("/sys/devices/system/cpu");
+    if (!dir) return;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.find("cpu") != 0) continue;
+        std::string epp = "/sys/devices/system/cpu/" + name + "/cpufreq/energy_performance_preference";
+        int max_freq = 0;
+        if (read_file(epp) == "") continue;
+        read_attr("/sys/devices/system/cpu/" + name + "/cpufreq", "cpuinfo_max_freq", max_freq);
+        if (max_freq > global_max_freq) global_max_freq = max_freq;
+        cpus.push_back({epp, max_freq});
+    }
+    closedir(dir);
+
+    if (cpus.empty()) return;
+    if (global_max_freq == 0) {
+        for (auto& c : cpus) g_pcore_epp_paths.push_back(c.first);
+        return;
+    }
+
+    int threshold = (int)(global_max_freq * 0.9);
+    for (auto& c : cpus) {
+        if (c.second >= threshold)
+            g_pcore_epp_paths.push_back(c.first);
+        else
+            g_ecore_epp_paths.push_back(c.first);
+    }
+    syslog(LOG_INFO, "clusters: %zu P-cores, %zu E-cores",
+           g_pcore_epp_paths.size(), g_ecore_epp_paths.size());
+}
+
+// ── EPP write (per cluster, only when changed) ──
+static std::string g_current_epp_p;
+static std::string g_current_epp_e;
+static void set_epp(const std::string& p_val, const std::string& e_val) {
+    if (p_val == g_current_epp_p && e_val == g_current_epp_e) return;
+    bool any = false;
+    for (auto& p : g_pcore_epp_paths) { write_str(p, p_val); any = true; }
+    for (auto& p : g_ecore_epp_paths) { write_str(p, e_val); any = true; }
+    g_current_epp_p = p_val;
+    g_current_epp_e = e_val;
+    if (any) {
+        std::string msg = "EPP -> P:" + p_val;
+        if (e_val != p_val) msg += "  E:" + e_val;
+        syslog(LOG_INFO, "%s", msg.c_str());
+    }
+}
+
+// Legacy single-value EPP for save/restore (writes same value to all CPUs)
+static void set_epp_legacy_all(const std::string& val) {
+    for (auto& p : g_pcore_epp_paths) write_str(p, val);
+    for (auto& p : g_ecore_epp_paths) write_str(p, val);
+}
+
 // ── Saved state (restored on exit) ──
 static int    g_saved_max_perf   = 100;
 static int    g_saved_min_perf   = 8;
 static int    g_saved_no_turbo   = 0;
 static std::string g_saved_epp;
 
-static std::vector<std::string> list_epp_paths() {
-    std::vector<std::string> paths;
-    DIR* dir = opendir("/sys/devices/system/cpu");
-    if (!dir) return paths;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name.find("cpu") != 0) continue;
-        std::string epp = "/sys/devices/system/cpu/" + name + "/cpufreq/energy_performance_preference";
-        if (read_file(epp) != "") paths.push_back(epp);
-    }
-    closedir(dir);
-    return paths;
-}
-
 static void save_cpu_state() {
     read_attr(PSTATE_DIR, "max_perf_pct", g_saved_max_perf);
     read_attr(PSTATE_DIR, "min_perf_pct", g_saved_min_perf);
     read_attr(PSTATE_DIR, "no_turbo", g_saved_no_turbo);
-    auto epps = list_epp_paths();
-    if (!epps.empty()) g_saved_epp = read_file(epps[0]);
+    if (!g_pcore_epp_paths.empty())
+        g_saved_epp = read_file(g_pcore_epp_paths[0]);
     syslog(LOG_INFO, "saved state: max_perf=%d  min_perf=%d  no_turbo=%d  epp=%s",
            g_saved_max_perf, g_saved_min_perf, g_saved_no_turbo, g_saved_epp.c_str());
 }
@@ -173,30 +224,9 @@ static void restore_cpu_state() {
     write_int(PSTATE_MAX, g_saved_max_perf);
     write_int(PSTATE_MIN, g_saved_min_perf);
     write_int(PSTATE_NOTURBO, g_saved_no_turbo);
-    if (!g_saved_epp.empty()) {
-        for (auto& p : list_epp_paths())
-            write_str(p, g_saved_epp);
-    }
+    if (!g_saved_epp.empty())
+        set_epp_legacy_all(g_saved_epp);
     syslog(LOG_INFO, "restored CPU state");
-}
-
-// ── EPP write (all policies, only when changed) ──
-static std::string g_current_epp;
-static void set_epp(const std::string& value) {
-    if (value == g_current_epp) return;
-    g_current_epp = value;
-    bool ok = false;
-    DIR* dir = opendir("/sys/devices/system/cpu");
-    if (!dir) return;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name.find("cpu") != 0) continue;
-        std::string epp = "/sys/devices/system/cpu/" + name + "/cpufreq/energy_performance_preference";
-        if (read_file(epp) != "") { write_str(epp, value); ok = true; }
-    }
-    closedir(dir);
-    if (ok) syslog(LOG_INFO, "EPP -> %s", value.c_str());
 }
 
 // ── GPU throttle tracking ──
@@ -402,6 +432,8 @@ int main(int argc, char** argv) {
     else
         syslog(LOG_WARNING, "coretemp not found — no temperature-aware capping");
 
+    discover_clusters();
+
     // Override PL1 from sysfs if not explicitly set
     double sysfs_pl1 = read_pl1_w(PKG_DIR);
     if (sysfs_pl1 > 0) {
@@ -542,14 +574,17 @@ int main(int argc, char** argv) {
         no_turbo = std::max(no_turbo, thermal.no_turbo);
         write_int(PSTATE_NOTURBO, no_turbo);
 
-        // ── EPP — never use "performance" (heat/ROI unacceptable per user) ──
+        // ── EPP — per-cluster: P-cores get throttled first, E-cores stay responsive
         // Temperature overrides aggression when hotter
-        std::string epp_val = "balance_performance";
-        if (aggression >= 2)       epp_val = "power";
-        else if (aggression >= 1)  epp_val = "balance_power";
-        if (thermal.epp_tier >= 2)       epp_val = "power";
-        else if (thermal.epp_tier >= 1)  epp_val = "balance_power";
-        set_epp(epp_val);
+        // On hybrid: P-cores take the aggressive value, E-cores are 1 tier less aggressive
+        // (except at critical temp >= 90°C where both get power)
+        std::string p_val = "balance_performance";
+        std::string e_val = "balance_performance";
+        if (aggression >= 2)       { p_val = "power";             e_val = "balance_power"; }
+        else if (aggression >= 1)  { p_val = "balance_power";     e_val = "balance_performance"; }
+        if (thermal.epp_tier >= 2) { p_val = "power";             if (thermal.temp_c < 90.0) e_val = "balance_power"; else e_val = "power"; }
+        else if (thermal.epp_tier >= 1) { p_val = "balance_power"; e_val = "balance_performance"; }
+        set_epp(p_val, e_val);
 
         // ── Log state changes ──
         if (aggression != last_aggression || iterations % 20 == 0) {
@@ -569,10 +604,12 @@ int main(int argc, char** argv) {
             char temp_buf[32] = "";
             if (thermal.temp_c >= 0)
                 snprintf(temp_buf, sizeof(temp_buf), "  temp=%.0fC", thermal.temp_c);
+            std::string epp_str = p_val;
+            if (e_val != p_val) epp_str += "(" + e_val + ")";
             syslog(LOG_INFO, "[%s] pkg=%.1fW core=%.1fW gpu=%.1fW(gpu_sm=%.1fW) "
                    "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s",
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
-                   pl1_w, core_limit_r, max_perf, no_turbo, epp_val.c_str(),
+                   pl1_w, core_limit_r, max_perf, no_turbo, epp_str.c_str(),
                    temp_buf,
                    throttle_summary.empty() ? "" : "  throttle: ",
                    throttle_summary.c_str());
