@@ -2,9 +2,9 @@
 
 GPU-first power balancer daemon for Intel hybrid architectures (Meteor Lake
 and similar).  The **GPU must never throttle** — the CPU is the expendable
-buffer.  The daemon constrains CPU frequency, turbo, RAPL budgets, and EPP so
-the GPU always has full power headroom, while independently capping CPU
-temperature.
+buffer.  The daemon constrains CPU frequency, turbo, RAPL budgets, EPP, and
+CPU core topology so the GPU always has full power headroom, while
+independently capping CPU temperature.
 
 Also includes `power-status` — a terminal power monitor (self-explanatory:
 `power-status --help`).
@@ -21,7 +21,12 @@ classifies GPU state as one of three aggression levels:
 |-------|---------|--------|
 | **idle** (0) | GPU in RC6, draw below 3 W | Relax all CPU controls: max_perf=100%, no_turbo=0, EPP=`balance_performance` |
 | **active** (1) | GPU out of RC6 or draw above 3 W | Moderate CPU back-off: max_perf scales inversely with GPU power (50% minimum), turbo disabled above 15 W GPU draw, EPP=`balance_power` |
-| **throttle** (2) | Any GPU throttle flag active | CRITICAL — hammer the CPU: max_perf=20%, no_turbo=1, EPP=`power`, core RAPL budget capped at 8 W |
+| **throttle** (2) | Any GPU throttle flag active (excluding PL4) | CRITICAL — hammer the CPU: max_perf=20%, no_turbo=1, EPP=`power`, core RAPL budget capped at 8 W |
+
+GPU PL4 (peak current) events are **not** treated as a throttle trigger —
+they are the GPU tile's normal internal peak current management handled
+transparently by the GuC firmware.  PL4 events are still tracked and logged
+but do not escalate aggression.
 
 ### RAPL budget allocation
 
@@ -34,6 +39,14 @@ core_budget = PL1 − gpu_draw − headroom_margin
 
 On Meteor Lake the MMIO RAPL domain (`intel-rapl-mmio`) is also kept in sync
 with the MSR PL1 so it does not become a hidden bottleneck.
+
+### Package PL1
+
+The daemon raises the package PL1 to a configurable value at startup (default
+40 W).  While the declared `max_power_uw` may be lower (e.g., 28 W), the
+hardware VR accepts higher values.  Raising PL1 gives the GPU tile's voltage
+regulator more peak current headroom, dramatically reducing GPU PL4 (peak
+power) events.
 
 ### Temperature-aware overlay
 
@@ -57,9 +70,27 @@ package power drops and the CPU cools.
 
 The daemon watches the Xe driver's 8 throttle reason flags (pl1, pl2, pl4,
 prochot, thermal, ratl, vr_tdc, vr_thermalert).  Rising-edge events are
-accumulated in counters, printed in periodic log lines, and summarized on
-exit.  Throttle detection is suppressed for the first 3 cycles to let RAPL
-counters settle.
+accumulated in counters, printed in periodic log lines as `gpu-throttle:`,
+and summarized on exit.  Throttle detection is suppressed for the first 3
+cycles to let RAPL counters settle.
+
+PL4 is **excluded from aggression detection** — it is the GPU tile's normal
+peak current management handled by the GuC firmware.  All 8 reasons are
+still tracked and logged.
+
+### GPU power profile
+
+The daemon forces both GPU tiles (gt0 render, gt1 media) to the `base`
+power profile at startup, overriding the `power_saving` default.  The
+original profile is saved and restored on exit.  GPU performance is
+non-negotiable — all CPU controls are the expendable variable.
+
+### CPU MSR perf limit monitoring
+
+The daemon reads MSR 0x6B0 (Package Perf Limit Reasons) each cycle and logs
+currently active CPU throttle reasons as `cpu-throttle:` in the periodic log
+line (e.g., `cpu-throttle: Core/Cache` when PP0 core budget is capped).
+Rising-edge events are accumulated per reason and reported on exit.
 
 ### CPU controls
 
@@ -67,10 +98,36 @@ counters settle.
 |---------|-----------|-------|
 | Frequency cap | `intel_pstate/max_perf_pct` | Scaled by aggression level and temperature |
 | Turbo | `intel_pstate/no_turbo` | Forced off when GPU draws >15 W, GPU throttling, or temp ≥82°C |
-| EPP | `energy_performance_preference` per CPU | Cycles through `balance_performance` / `balance_power` / `power` — never `performance` |
+| EPP | `energy_performance_preference` per CPU | Per-cluster: P-cores throttled first, E-cores 1 tier less aggressive. Cycles through `balance_performance` / `balance_power` / `power` — never `performance` |
 | RAPL PP0 | `constraint_0_power_limit_uw` | Core budget derived from PL1 minus GPU draw |
+| CPU hotplug | core offlining via `cpu/online` | P-cores offlined first (keeping at least 2), then E-cores |
 
 All CPU controls are saved on startup and restored on exit (SIGINT/SIGTERM/SIGHUP).
+
+### CPU hotplug (core offlining)
+
+In heavy/throttling states the daemon offlines entire physical cores to
+eliminate leakage and switching power.  Cores are grouped by physical core
+(HT siblings share a group).  The offlining priority is:
+
+1. **P-cores** offlined first (highest CPU number first)
+2. **E-cores** offlined next (highest CPU number first)
+3. **CPU0's group and at least 2 P-core groups** are always kept online
+
+The number of groups to keep depends on aggression and temperature:
+
+| State | Groups kept |
+|-------|-------------|
+| idle/cool (<70°C) | All groups |
+| moderate (active, 70–80°C) | 12 groups |
+| heavy (GPU >15 W, 80–85°C) | 8 groups |
+| throttle (GPU throttling, 85–90°C) | 4 groups |
+| critical (aggression≥2, ≥90°C) | 1 group (P-core group with CPU0) |
+
+Changes are throttled with a 20-cycle settle period (~10 s).  `min_perf_pct`
+is dropped to 0 when any cores are offlined so remaining idle cores reach
+minimum frequency and deepest C-states.  Initial online state is saved on
+startup and restored on exit.
 
 ### Hardware discovery
 
@@ -102,7 +159,7 @@ cmake -B build && cmake --build build
 ### Run
 
 ```sh
-sudo ./power-balance                        # use sysfs PL1
+sudo ./power-balance                        # default PL1 (40 W)
 sudo ./power-balance --pl1 35               # override PL1 to 35 W
 ```
 
@@ -122,12 +179,21 @@ Logs are available via `journalctl -u power-balance`.
 ### Log output
 
 ```
-[active] pkg=34.5W core=10.4W gpu=18.9W(gpu_sm=18.6W) pl1=28.0W 
-  core_lmt=7.4W max_perf=50% no_turbo=1 epp=balance_power  temp=85C
+[active] pkg=25.4W core=8.0W gpu=12.5W(gpu_sm=11.5W) pl1=40.0W 
+  core_lmt=24.8W max_perf=62% no_turbo=0 epp=balance_power  temp=77C  
+  gpu-throttle: pl4:2
+```
+
+```
+[balance-throttle] pkg=25.4W core=7.7W gpu=11.3W(gpu_sm=12.1W) pl1=40.0W 
+  core_lmt=8.0W max_perf=20% no_turbo=1 epp=power(balance_power)  temp=85C  
+  gpu-throttle: pl4:4  cpu-throttle: Core/Cache
 ```
 
 Periodic log lines (every 20 iterations = 10 s) include power readings,
-applied limits, and temperature.
+applied limits, temperature, GPU throttle event counts (`gpu-throttle:`),
+and CPU MSR perf limit reasons (`cpu-throttle:`).  The `hotplug` line shows
+core offlining changes.
 
 ### power-status
 

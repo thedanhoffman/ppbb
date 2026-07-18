@@ -23,7 +23,7 @@
 #include <syslog.h>
 
 // ── Configuration ──
-static constexpr double   DEFAULT_PL1_W        = 28.0;
+static constexpr double   DEFAULT_PL1_W        = 40.0;
 static constexpr int      INTERVAL_MS          = 500;
 static constexpr double   GPU_ACTIVE_W         = 3.0;   // above this, GPU considered active
 static constexpr double   GPU_HEAVY_W          = 15.0;  // above this, disable CPU turbo
@@ -111,9 +111,12 @@ static bool discover_rapl() {
 }
 
 // ── GPU path discovery ──
-static std::string GPU_GT0;        // base path for gt0
+static std::string GPU_GT0;        // base path for gt0 (render)
+static std::string GPU_GT1;        // base path for gt1 (media)
 static std::string GPU_THROTTLE;   // throttle/reasons file
 static std::string GPU_IDLE;       // gtidle/idle_status file
+static std::string g_saved_gt0_profile;
+static std::string g_saved_gt1_profile;
 
 static void discover_gpu() {
     DIR* drm = opendir("/sys/class/drm");
@@ -122,14 +125,28 @@ static void discover_gpu() {
     while ((de = readdir(drm)) != nullptr) {
         std::string card = de->d_name;
         if (card.find("card") != 0) continue;
-        std::string base = "/sys/class/drm/" + card + "/device/tile0/gt0";
-        if (read_file(base + "/freq0/cur_freq") == "") continue;
-        GPU_GT0 = base;
-        GPU_THROTTLE = base + "/freq0/throttle/reasons";
-        GPU_IDLE = base + "/gtidle/idle_status";
+        std::string base0 = "/sys/class/drm/" + card + "/device/tile0/gt0";
+        if (read_file(base0 + "/freq0/cur_freq") == "") continue;
+        GPU_GT0 = base0;
+        GPU_THROTTLE = base0 + "/freq0/throttle/reasons";
+        GPU_IDLE = base0 + "/gtidle/idle_status";
+        std::string base1 = "/sys/class/drm/" + card + "/device/tile0/gt1";
+        if (read_file(base1 + "/freq0/cur_freq") != "") GPU_GT1 = base1;
         break;
     }
     closedir(drm);
+}
+
+static void set_gpu_profile(const std::string& profile) {
+    for (auto& gpu : {GPU_GT0, GPU_GT1}) {
+        if (gpu.empty()) continue;
+        std::string path = gpu + "/freq0/power_profile";
+        std::string cur = read_file(path);
+        if (cur.empty()) continue;
+        // The file shows "current    available" — check if not already our target
+        if (cur.find(profile) == std::string::npos || cur.find("[" + profile + "]") == std::string::npos)
+            write_str(path, profile);
+    }
 }
 
 // ── CPU control paths ──
@@ -246,8 +263,10 @@ static void discover_topology() {
             if (read_attr(cpufreq_dir, "cpuinfo_max_freq", mf))
                 g.is_pcore = (mf >= threshold);
         }
-        // Priority: E-cores first, then higher CPU-numbered P-cores
-        g.priority = g.is_pcore ? g.cpus[0] : (1000 + g.cpus[0]);
+            // Priority: P-cores first (offlined first), then E-cores.
+        // Within each class, higher CPU number = offlined first.
+        // At least 2 P-cores are always kept (enforced in apply_hotplug).
+        g.priority = g.is_pcore ? (1000 + g.cpus[0]) : g.cpus[0];
         g.saved_online = true;
         g_core_groups.push_back(g);
     }
@@ -302,40 +321,50 @@ static int g_keep_groups_target = -1;
 static void apply_hotplug(int aggression, double temp_c, double gpu_w) {
     if (g_core_groups.empty()) return;
 
-    // Skip changes during settle (after a change, wait N cycles)
     if (g_hotplug_settle > 0) { g_hotplug_settle--; return; }
 
     int target = compute_keep_groups(aggression, temp_c, gpu_w);
-    target = std::max(target, 1); // never offline everything
-    if (target == g_keep_groups_target) return; // no change needed
+    target = std::max(target, 1);
+    if (target == g_keep_groups_target) return;
 
+    int total = (int)g_core_groups.size();
     int current = count_online_groups();
-    bool changed = false;
 
-    // Offline excess groups (highest priority / most expendable first)
-    for (int i = 0; i < (int)g_core_groups.size(); ++i) {
-        if (i < (int)g_core_groups.size() - target) {
-            // This group should be offline
-            auto& g = g_core_groups[i];
-            // Don't offline CPU0
-            bool has_cpu0 = false;
-            for (int c : g.cpus) { if (c == 0) has_cpu0 = true; break; }
-            if (has_cpu0) continue;
-            for (int c : g.cpus) {
-                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 0);
-            }
-            changed = true;
+    // Build a "should_online" mask for each group:
+    // 1. Start by marking the last `target` groups (lowest priority / most worth keeping)
+    // 2. CPU0 group always online — mark it before any P-core minimum check
+    // 3. Ensure at least 2 P-core groups remain (CPU0 counts toward this)
+    std::vector<bool> should_online(total, false);
+    for (int i = total - target; i < total; ++i) should_online[i] = true;
+
+    for (int i = 0; i < total; ++i)
+        for (int c : g_core_groups[i].cpus)
+            if (c == 0) { should_online[i] = true; break; }
+
+    // Ensure at least 2 P-core groups including CPU0
+    for (int i = 0; i < total; ++i) {
+        if (!should_online[i] && g_core_groups[i].is_pcore) {
+            int p_would_stay = 0;
+            for (int j = 0; j < total; ++j)
+                if (should_online[j] && g_core_groups[j].is_pcore) p_would_stay++;
+            if (p_would_stay < 2) should_online[i] = true;
         }
     }
 
-    // Online groups that were previously offlined
-    for (int i = 0; i < (int)g_core_groups.size(); ++i) {
-        if (i >= (int)g_core_groups.size() - target) {
-            // This group should be online
-            auto& g = g_core_groups[i];
-            for (int c : g.cpus) {
+    // Apply: offline groups marked offline, online groups marked online
+    bool changed = false;
+    for (int i = 0; i < total; ++i) {
+        auto& g = g_core_groups[i];
+        std::string s = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+        bool is_online = (s != "0");
+        if (is_online && !should_online[i]) {
+            for (int c : g.cpus)
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 0);
+            changed = true;
+        } else if (!is_online && should_online[i]) {
+            for (int c : g.cpus)
                 write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 1);
-            }
+            changed = true;
         }
     }
 
@@ -344,7 +373,7 @@ static void apply_hotplug(int aggression, double temp_c, double gpu_w) {
         syslog(LOG_INFO, "hotplug: %d groups online (target=%d, keep=%d)",
                new_count, target, current);
         g_keep_groups_target = target;
-        g_hotplug_settle = 20; // wait ~10s before next change
+        g_hotplug_settle = 20;
     }
 }
 
@@ -382,10 +411,14 @@ static void set_epp_legacy_all(const std::string& val) {
 }
 
 // ── Saved state (restored on exit) ──
+static bool msr_available();
+static unsigned long long read_msr(int cpu, unsigned int msr_addr);
+static bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val);
 static int    g_saved_max_perf   = 100;
 static int    g_saved_min_perf   = 8;
 static int    g_saved_no_turbo   = 0;
 static std::string g_saved_epp;
+static unsigned long long g_saved_msr_1fc = 0;
 
 static void save_cpu_state() {
     read_attr(PSTATE_DIR, "max_perf_pct", g_saved_max_perf);
@@ -393,6 +426,9 @@ static void save_cpu_state() {
     read_attr(PSTATE_DIR, "no_turbo", g_saved_no_turbo);
     if (!g_pcore_epp_paths.empty())
         g_saved_epp = read_file(g_pcore_epp_paths[0]);
+    g_saved_gt0_profile = GPU_GT0.empty() ? "" : read_file(GPU_GT0 + "/freq0/power_profile");
+    g_saved_gt1_profile = GPU_GT1.empty() ? "" : read_file(GPU_GT1 + "/freq0/power_profile");
+    g_saved_msr_1fc = msr_available() ? read_msr(0, 0x1FC) : 0;
     syslog(LOG_INFO, "saved state: max_perf=%d  min_perf=%d  no_turbo=%d  epp=%s",
            g_saved_max_perf, g_saved_min_perf, g_saved_no_turbo, g_saved_epp.c_str());
 }
@@ -403,7 +439,10 @@ static void restore_cpu_state() {
     write_int(PSTATE_NOTURBO, g_saved_no_turbo);
     if (!g_saved_epp.empty())
         set_epp_legacy_all(g_saved_epp);
-    syslog(LOG_INFO, "restored CPU state");
+    if (!g_saved_gt0_profile.empty()) write_str(GPU_GT0 + "/freq0/power_profile", g_saved_gt0_profile);
+    if (!g_saved_gt1_profile.empty()) write_str(GPU_GT1 + "/freq0/power_profile", g_saved_gt1_profile);
+    if (g_saved_msr_1fc) write_msr(0, 0x1FC, g_saved_msr_1fc);
+    syslog(LOG_INFO, "restored CPU and GPU state");
 }
 
 // ── GPU throttle tracking ──
@@ -423,6 +462,12 @@ struct GpuThrottleCounters {
     bool prev_state[8] = {false};
 };
 
+// Returns 1 if any serious throttle reason active.  GPU-internal power limit
+// events (PL1, PL2, PL4) are excluded — they are normal GuC-managed peak
+// current management at the frequency ceiling.  PROCHOT is also excluded since
+// we disable the external PROCHOT# response on the CPU (MSR 0x1FC bit 0).
+// Only genuine thermal/current alerts (thermal, vr_tdc, vr_thermalert, ratl)
+// trigger aggression escalation.
 static int gpu_throttling(GpuThrottleCounters* counters) {
     std::string throttle_dir = GPU_GT0 + "/freq0/throttle";
     int any = 0;
@@ -430,7 +475,8 @@ static int gpu_throttling(GpuThrottleCounters* counters) {
         int v = 0;
         read_attr(throttle_dir, THROTTLE_FILES[i], v);
         bool active = (v != 0);
-        if (active) any = 1;
+        // indices: 0=pl1, 1=pl2, 2=pl4, 3=prochot — all excluded
+        if (active && i > 3) any = 1;
         if (counters && active && !counters->prev_state[i]) {
             counters->events[i]++;
             counters->total_events++;
@@ -444,6 +490,75 @@ static int gpu_throttling(GpuThrottleCounters* counters) {
 static bool gpu_active() {
     std::string s = read_file(GPU_IDLE);
     return s.find("c6") == std::string::npos;
+}
+
+// ── CPU Perf Limit Reasons (MSR 0x6B0, 0x690) ──
+static const struct { const char* name; int bit; } PERF_LIMIT_REASONS[] = {
+    {"PROCHOT",          0},
+    {"Thermal",          1},
+    {"Current(EDP)",     2},
+    {"Power(PL1)",       3},
+    {"Platform",         4},
+    {"Autonomous",       5},
+    {"VR_Thermal",       6},
+    {"HTC",              7},
+    {"Core/Cache",       8},
+    {"Amps",             9},
+    {"PROCHOT_Deassert",10},
+    {"PL4/Peak",        11},
+    {"PkgPwrLatch",     12},
+    {"Clipping",        13},
+    {nullptr, 0}
+};
+
+static bool msr_available() {
+    int fd = open("/dev/cpu/0/msr", O_RDONLY);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+}
+
+static unsigned long long read_msr(int cpu, unsigned int msr_addr) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned long long val = 0;
+    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
+        if (read(fd, &val, sizeof(val)) != sizeof(val)) val = 0;
+    }
+    close(fd);
+    return val;
+}
+
+static bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return false;
+    bool ok = false;
+    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
+        ok = (write(fd, &val, sizeof(val)) == sizeof(val));
+    }
+    close(fd);
+    return ok;
+}
+
+struct PerfLimitCounters {
+    int events[16] = {0};
+    unsigned int prev_current = 0;
+};
+
+static void track_perf_limits(PerfLimitCounters* pl, int cpu) {
+    unsigned long long msr = read_msr(cpu, 0x6B0);
+    unsigned int current = msr & 0xFFFF;
+    if (!pl) return;
+    unsigned int newly = current & ~pl->prev_current;
+    for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
+        unsigned int m = 1u << PERF_LIMIT_REASONS[i].bit;
+        if (newly & m) pl->events[i]++;
+    }
+    pl->prev_current = current;
 }
 
 // ── Temperature ──
@@ -554,11 +669,8 @@ static double compute_power_w(const Sample& prev, const Sample& cur) {
 }
 
 static double read_pl1_w(const std::string& dir) {
-    long long uw = 0, max_uw = 0;
-    // The effective limit is the min of the set value and the hardware max cap
+    long long uw = 0;
     read_attr(dir, "constraint_0_power_limit_uw", uw);
-    read_attr(dir, "constraint_0_max_power_uw", max_uw);
-    if (max_uw > 0) uw = std::min(uw, max_uw);
     if (uw > 0) return uw / 1e6;
     return DEFAULT_PL1_W;
 }
@@ -600,9 +712,12 @@ int main(int argc, char** argv) {
            PKG_MMIO_DIR.empty() ? "?" : PKG_MMIO_DIR.c_str());
     discover_coretemp();
 
-    if (!GPU_GT0.empty())
+    if (!GPU_GT0.empty()) {
         syslog(LOG_INFO, "GPU gt0=%s", GPU_GT0.c_str());
-    else
+        if (!GPU_GT1.empty())
+            syslog(LOG_INFO, "GPU gt1=%s", GPU_GT1.c_str());
+        set_gpu_profile("base");
+    } else
         syslog(LOG_WARNING, "GPU not found — running in CPU-only mode");
     if (!CORETEMP_DIR.empty())
         syslog(LOG_INFO, "coretemp=%s", CORETEMP_DIR.c_str());
@@ -612,14 +727,17 @@ int main(int argc, char** argv) {
     discover_clusters();
     discover_topology();
 
-    // Override PL1 from sysfs if not explicitly set
+    // Read system PL1 for logging reference only (we raise it below)
     double sysfs_pl1 = read_pl1_w(PKG_DIR);
-    if (sysfs_pl1 > 0) {
-        if (pl1_w == DEFAULT_PL1_W || !std::isnan(pl1_w))
-            pl1_w = sysfs_pl1;
-    }
-    // Also read MMIO PL1 for reference
+    (void)sysfs_pl1;
     double mmio_pl1 = PKG_MMIO_DIR.empty() ? pl1_w : read_pl1_w(PKG_MMIO_DIR);
+
+    // Raise hardware PL1 to desired value on both MSR and MMIO domains.
+    // The hardware max_power_uw is conservative — actual VR can handle more.
+    // Higher PL1 gives the GPU VR more peak current headroom, avoiding PL4 events.
+    write_int(PKG_DIR + "/constraint_0_power_limit_uw", (long long)(pl1_w * 1e6));
+    if (!PKG_MMIO_DIR.empty())
+        write_int(PKG_MMIO_DIR + "/constraint_0_power_limit_uw", (long long)(pl1_w * 1e6));
 
     // Enable RAPL domains
     write_file(PKG_DIR + "/enabled", "1");
@@ -628,6 +746,19 @@ int main(int argc, char** argv) {
 
     // Save initial CPU state
     save_cpu_state();
+
+    // The EC on this laptop asserts PROCHOT# even at low temperatures (44°C / 4W),
+    // which conflicts with the daemon's own thermal management.  Disable the
+    // external PROCHOT# response (MSR 0x1FC bit 0), since we handle throttling
+    // ourselves via aggression levels, temperature overlay, and core offlining.
+    // This is a standard Intel MSR — restored on exit.
+    if (msr_available()) {
+        unsigned long long msr_1fc = read_msr(0, 0x1FC);
+        if (msr_1fc & 1) {
+            write_msr(0, 0x1FC, msr_1fc & ~1ULL);
+            syslog(LOG_INFO, "external PROCHOT# response disabled (MSR 0x1FC bit 0)");
+        }
+    }
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
@@ -650,8 +781,10 @@ int main(int argc, char** argv) {
     bool first = true;
     int iterations = 0;
 
-    // Track GPU throttle events
+    // Track throttle events (GPU and CPU MSR)
     GpuThrottleCounters gpu_tc;
+    bool msr_ok = msr_available();
+    PerfLimitCounters pl_tc;
     int last_aggression = -1; // 0=idle, 1=active, 2=throttling
 
     while (g_running) {
@@ -682,6 +815,9 @@ int main(int argc, char** argv) {
         if (settle_cycles <= 0) throttling = have_gpu ? (gpu_throttling(&gpu_tc) != 0) : false;
         bool active = have_gpu ? gpu_active() : false;
         if (settle_cycles > 0) settle_cycles--;
+
+        // ── Track CPU MSR perf limit reasons ──
+        if (msr_ok) track_perf_limits(&pl_tc, 0);
 
         // ── Determine aggression level ──
         // 0 = GPU idle: relax CPU controls
@@ -733,6 +869,15 @@ int main(int argc, char** argv) {
                 write_int(PKG_MMIO_DIR + "/constraint_0_power_limit_uw", target);
         }
 
+        // ── PROCHOT# response ──
+        // The EC/firmware keeps re-enabling PROCHOT# response (MSR 0x1FC bit 0).
+        // Clear it every cycle since we manage throttling ourselves.
+        if (msr_ok) {
+            unsigned long long msr_1fc = read_msr(0, 0x1FC);
+            if (msr_1fc & 1)
+                write_msr(0, 0x1FC, msr_1fc & ~1ULL);
+        }
+
         // ── CPU frequency capping ──
         // Combine aggression-based cap with thermal cap (most conservative wins)
         int max_perf = 100;
@@ -776,33 +921,47 @@ int main(int argc, char** argv) {
             const char* state = "idle";
             if (aggression == 1) state = "active";
             if (aggression == 2) state = "balance-throttle";
-            // Build throttle event summary
-            std::string throttle_summary;
+            // Build GPU throttle event summary
+            std::string gpu_thr;
             if (have_gpu && gpu_tc.total_events > 0) {
                 for (int i = 0; THROTTLE_REASONS[i]; ++i) {
                     if (gpu_tc.events[i] > 0) {
-                        if (!throttle_summary.empty()) throttle_summary += " ";
-                        throttle_summary += std::string(THROTTLE_REASONS[i]) + ":" + std::to_string(gpu_tc.events[i]);
+                        if (!gpu_thr.empty()) gpu_thr += " ";
+                        gpu_thr += std::string(THROTTLE_REASONS[i]) + ":" + std::to_string(gpu_tc.events[i]);
                     }
                 }
             }
+            // Build CPU MSR perf limit summary (currently active reasons)
+            std::string cpu_thr;
+            if (msr_ok) {
+                unsigned long long msr = read_msr(0, 0x6B0);
+                unsigned int current = msr & 0xFFFF;
+                for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
+                    if (i == 0) continue;  // PROCHOT — external signal we disabled via MSR 0x1FC
+                    if (current & (1u << PERF_LIMIT_REASONS[i].bit)) {
+                        if (!cpu_thr.empty()) cpu_thr += " ";
+                        cpu_thr += PERF_LIMIT_REASONS[i].name;
+                    }
+                }
+            }
+            std::string throttle_summary;
+            if (!gpu_thr.empty()) throttle_summary += "  gpu-throttle: " + gpu_thr;
+            if (!cpu_thr.empty()) throttle_summary += "  cpu-throttle: " + cpu_thr;
             char temp_buf[32] = "";
             if (thermal.temp_c >= 0)
                 snprintf(temp_buf, sizeof(temp_buf), "  temp=%.0fC", thermal.temp_c);
             std::string epp_str = p_val;
             if (e_val != p_val) epp_str += "(" + e_val + ")";
             syslog(LOG_INFO, "[%s] pkg=%.1fW core=%.1fW gpu=%.1fW(gpu_sm=%.1fW) "
-                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s",
+                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s",
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
                    pl1_w, core_limit_r, max_perf, no_turbo, epp_str.c_str(),
-                   temp_buf,
-                   throttle_summary.empty() ? "" : "  hw-throttle: ",
-                   throttle_summary.c_str());
+                   temp_buf, throttle_summary.c_str());
             last_aggression = aggression;
         }
     }
 
-    // ── Report final GPU throttle statistics ──
+    // ── Report final throttle statistics ──
     if (have_gpu && gpu_tc.total_events > 0) {
         std::string summary;
         for (int i = 0; THROTTLE_REASONS[i]; ++i) {
@@ -811,10 +970,27 @@ int main(int argc, char** argv) {
                 summary += std::string(THROTTLE_REASONS[i]) + "=" + std::to_string(gpu_tc.events[i]);
             }
         }
-        syslog(LOG_INFO, "hardware throttle events: %d total (%s)  cycles_throttled=%d",
+        syslog(LOG_INFO, "GPU hardware throttle events: %d total (%s)  cycles_throttled=%d",
                gpu_tc.total_events, summary.c_str(), gpu_tc.cycles_throttled);
     } else if (have_gpu) {
-        syslog(LOG_INFO, "hardware throttle events: none — no hardware throttling occurred during this session");
+        syslog(LOG_INFO, "GPU hardware throttle events: none");
+    }
+    if (msr_ok) {
+        std::string cpu_summary;
+        int cpu_total = 0;
+        for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
+            if (i == 0) continue;  // PROCHOT — external signal we disabled via MSR 0x1FC
+            if (pl_tc.events[i] > 0) {
+                if (!cpu_summary.empty()) cpu_summary += ", ";
+                cpu_summary += std::string(PERF_LIMIT_REASONS[i].name) + "=" + std::to_string(pl_tc.events[i]);
+                cpu_total += pl_tc.events[i];
+            }
+        }
+        if (cpu_total > 0) {
+            syslog(LOG_INFO, "CPU perf limit events: %d total (%s)", cpu_total, cpu_summary.c_str());
+        } else {
+            syslog(LOG_INFO, "CPU perf limit events: none");
+        }
     }
 
     // ── Restore everything on exit ──
