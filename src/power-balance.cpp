@@ -181,6 +181,179 @@ static void discover_clusters() {
            g_pcore_epp_paths.size(), g_ecore_epp_paths.size());
 }
 
+// ── CPU hotplug (core offlining) ──
+// Groups CPUs by physical core (HT siblings share a group).  We offline
+// entire groups to eliminate leakage and switching power from unused cores.
+// E-cores get offlined first, then P-core HT pairs.
+
+struct CoreGroup {
+    int         id;              // group index
+    bool        is_pcore;
+    bool        has_ht;          // true if this group has HT siblings
+    std::vector<int> cpus;       // logical CPU numbers in this group
+    int         priority;        // higher = offline first
+    bool        saved_online;    // initial state (for restore)
+};
+
+static std::vector<CoreGroup> g_core_groups;
+
+static void discover_topology() {
+    // Build core groups: CPUs sharing the same physical core
+    std::map<int, std::vector<int>> core_map;
+    DIR* dir = opendir("/sys/devices/system/cpu");
+    if (!dir) return;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.find("cpu") != 0) continue;
+        int cpu = -1;
+        try { cpu = std::stoi(name.substr(3)); } catch (...) { continue; }
+        if (cpu < 0) continue;
+        std::string topo = "/sys/devices/system/cpu/" + name + "/topology";
+        std::string siblings = read_file(topo + "/core_cpus_list");
+        if (siblings.empty()) siblings = read_file(topo + "/thread_siblings_list");
+        // Parse sibling list to find group key — use first CPU in the list
+        size_t comma = siblings.find(',');
+        size_t dash  = siblings.find('-');
+        std::string first = siblings.substr(0, comma != std::string::npos ? comma : (dash != std::string::npos ? dash : siblings.size()));
+        int key = 0;
+        if (!first.empty()) key = std::stoi(first);
+        core_map[key].push_back(cpu);
+    }
+    closedir(dir);
+
+    // Determine P/E type using max_freq from cluster discovery
+    int global_max = 0;
+    for (int cpu = 0; cpu < 256; ++cpu) {
+        int mf = 0;
+        if (!read_attr("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq", "cpuinfo_max_freq", mf)) break;
+        if (mf > global_max) global_max = mf;
+    }
+    int threshold = (int)(global_max * 0.9);
+
+    for (auto& kv : core_map) {
+        CoreGroup g;
+        g.id = (int)g_core_groups.size();
+        g.cpus = kv.second;
+        std::sort(g.cpus.begin(), g.cpus.end());
+        g.has_ht = g.cpus.size() > 1;
+        // Check first CPU's max_freq for P/E classification
+        int mf = 0;
+        std::string cpufreq_dir = "/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/cpufreq";
+        read_attr(cpufreq_dir, "cpuinfo_max_freq", mf);
+        g.is_pcore = (mf >= threshold && mf > 0);
+        // Priority: E-cores first, then higher CPU-numbered P-cores
+        g.priority = g.is_pcore ? g.cpus[0] : (1000 + g.cpus[0]);
+        g.saved_online = true;
+        g_core_groups.push_back(g);
+    }
+
+    // Sort by priority descending (highest = offline first)
+    std::sort(g_core_groups.begin(), g_core_groups.end(),
+        [](const CoreGroup& a, const CoreGroup& b) { return a.priority > b.priority; });
+
+    // Save initial online state
+    for (auto& g : g_core_groups) {
+        std::string online_str = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+        g.saved_online = (online_str != "0");
+    }
+
+    int p = 0, e = 0;
+    for (auto& g : g_core_groups) { if (g.is_pcore) p++; else e++; }
+    syslog(LOG_INFO, "topology: %d P-core groups, %d E-core groups (%zu logical CPUs)",
+           p, e, g_core_groups.size());
+}
+
+static int count_online_groups() {
+    int n = 0;
+    for (auto& g : g_core_groups) {
+        std::string s = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+        if (s != "0") n++;
+    }
+    return n;
+}
+
+// Target logical CPUs to keep online based on aggression + temperature.
+// Returns the number of CoreGroups to keep online.
+static int compute_keep_groups(int aggression, double temp_c, double gpu_w) {
+    // idle/cool:  all groups online
+    if (aggression <= 0 && temp_c < 70.0) return (int)g_core_groups.size();
+
+    // critical:   temp >= 90°C or GPU throttling hard → 1 P-core group (2 threads)
+    if (aggression >= 2 || temp_c >= 90.0) return 1;
+
+    // throttle:   temp 85-90°C or throttling → 3 P + 1 E = 4 groups (7 threads)
+    if (temp_c >= 85.0) return 4;
+
+    // heavy:      temp 80-85°C or GPU > 15W → 6 P + 2 E = 8 groups (14 threads)
+    if (aggression >= 1 || temp_c >= 80.0 || gpu_w > GPU_HEAVY_W) return 8;
+
+    // moderate:   temp 70-80°C or GPU active → 6 P + 6 E = 12 groups (18 threads)
+    return 12;
+}
+
+static int g_hotplug_settle = 0;
+static int g_keep_groups_target = -1;
+
+static void apply_hotplug(int aggression, double temp_c, double gpu_w) {
+    if (g_core_groups.empty()) return;
+
+    // Skip changes during settle (after a change, wait N cycles)
+    if (g_hotplug_settle > 0) { g_hotplug_settle--; return; }
+
+    int target = compute_keep_groups(aggression, temp_c, gpu_w);
+    target = std::max(target, 1); // never offline everything
+    if (target == g_keep_groups_target) return; // no change needed
+
+    int current = count_online_groups();
+    bool changed = false;
+
+    // Offline excess groups (highest priority / most expendable first)
+    for (int i = 0; i < (int)g_core_groups.size(); ++i) {
+        if (i < (int)g_core_groups.size() - target) {
+            // This group should be offline
+            auto& g = g_core_groups[i];
+            // Don't offline CPU0
+            bool has_cpu0 = false;
+            for (int c : g.cpus) { if (c == 0) has_cpu0 = true; break; }
+            if (has_cpu0) continue;
+            for (int c : g.cpus) {
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 0);
+            }
+            changed = true;
+        }
+    }
+
+    // Online groups that were previously offlined
+    for (int i = 0; i < (int)g_core_groups.size(); ++i) {
+        if (i >= (int)g_core_groups.size() - target) {
+            // This group should be online
+            auto& g = g_core_groups[i];
+            for (int c : g.cpus) {
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 1);
+            }
+        }
+    }
+
+    if (changed) {
+        int new_count = count_online_groups();
+        syslog(LOG_INFO, "hotplug: %d groups online (target=%d, keep=%d)",
+               new_count, target, current);
+        g_keep_groups_target = target;
+        g_hotplug_settle = 20; // wait ~10s before next change
+    }
+}
+
+static void restore_online_state() {
+    for (auto& g : g_core_groups) {
+        for (int c : g.cpus) {
+            if (g.saved_online)
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 1);
+        }
+    }
+    syslog(LOG_INFO, "restored CPU online state");
+}
+
 // ── EPP write (per cluster, only when changed) ──
 static std::string g_current_epp_p;
 static std::string g_current_epp_e;
@@ -433,6 +606,7 @@ int main(int argc, char** argv) {
         syslog(LOG_WARNING, "coretemp not found — no temperature-aware capping");
 
     discover_clusters();
+    discover_topology();
 
     // Override PL1 from sysfs if not explicitly set
     double sysfs_pl1 = read_pl1_w(PKG_DIR);
@@ -586,6 +760,13 @@ int main(int argc, char** argv) {
         else if (thermal.epp_tier >= 1) { p_val = "balance_power"; e_val = "balance_performance"; }
         set_epp(p_val, e_val);
 
+        // ── CPU hotplug (core offlining) ──
+        // Drop min_perf to 0 when cores are offlined so remaining idle cores
+        // can reach minimum frequency and deepest C-states.
+        apply_hotplug(aggression, thermal.temp_c, smoothed_gpu_w);
+        int min_perf = (g_keep_groups_target > 0 && g_keep_groups_target < (int)g_core_groups.size()) ? 0 : g_saved_min_perf;
+        write_int(PSTATE_MIN, min_perf);
+
         // ── Log state changes ──
         if (aggression != last_aggression || iterations % 20 == 0) {
             const char* state = "idle";
@@ -635,6 +816,7 @@ int main(int argc, char** argv) {
     // ── Restore everything on exit ──
     if (have_core)   write_int(CORE_DIR + "/constraint_0_power_limit_uw", 0);
     if (have_uncore) write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
+    restore_online_state();
     restore_cpu_state();
 
     syslog(LOG_INFO, "stopped");
