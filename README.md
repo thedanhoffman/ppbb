@@ -125,6 +125,42 @@ tolerating performance loss from a power-limited charge source.  The daemon
 continues to clear the PROCHOT# response regardless, so normal operation
 is unaffected while the warning is displayed.
 
+### Weak charger power-save mode
+
+When PROCHOT# from an insufficient charger is detected, the daemon goes a
+step further than just tolerating it: it enters **power-save** mode and
+aggressively reduces system power draw to stay within the charger's capacity.
+
+The power-save mode applies every available control simultaneously:
+
+| Control | Setting |
+|---------|---------|
+| Package PL1 | Lowered to ~70% of charger capacity (e.g., 10.5 W for a 15 W USB-C charger) |
+| Turbo | Forced off (`no_turbo=1`) |
+| `max_perf_pct` | Capped to 40% |
+| EPP (all cores) | Forced to `power` |
+| `min_perf_pct` | Forced to 0 for deepest idle states |
+| GPU `max_freq` | gt0 capped to 900 MHz, gt1 capped to 600 MHz |
+| Uncore (PP1) budget | Capped to 3 W (instead of unlimited) |
+| CPU hotplug | Keep only 4 core groups (~8 threads) |
+
+The charger is checked every 10 seconds.  When an adequate charger is
+detected (e.g., switching from USB-C to the barrel connector), all controls
+are restored to their normal aggression/temperature-derived values.
+
+The `[power-save]` state is displayed in the log state tag:
+
+```
+[power-save] pkg=3.6W core=1.2W gpu=0.1W(gpu_sm=0.1W) pl1=10.5W core_lmt=8.4W max_perf=40% no_turbo=1 epp=power  temp=49C  gpu-throttle: prochot:1
+```
+
+A transition message is logged on entry and exit:
+
+```
+weak charger: 15W USB-C charger — enabling power saving
+adequate charger detected — disabling power saving
+```
+
 ### CPU controls
 
 | Control | Mechanism | Notes |

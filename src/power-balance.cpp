@@ -117,6 +117,8 @@ static std::string GPU_THROTTLE;   // throttle/reasons file
 static std::string GPU_IDLE;       // gtidle/idle_status file
 static std::string g_saved_gt0_profile;
 static std::string g_saved_gt1_profile;
+static int g_saved_gt0_max_freq = -1;
+static int g_saved_gt1_max_freq = -1;
 
 static void discover_gpu() {
     DIR* drm = opendir("/sys/class/drm");
@@ -298,7 +300,9 @@ static int count_online_groups() {
 
 // Target logical CPUs to keep online based on aggression + temperature.
 // Returns the number of CoreGroups to keep online.
-static int compute_keep_groups(int aggression, double temp_c, double gpu_w) {
+static int compute_keep_groups(int aggression, double temp_c, double gpu_w, bool weak_charger = false) {
+    // If charger is weak, cap aggressively
+    if (weak_charger) return 4;
     // idle/cool:  all groups online
     if (aggression <= 0 && temp_c < 70.0) return (int)g_core_groups.size();
 
@@ -318,12 +322,12 @@ static int compute_keep_groups(int aggression, double temp_c, double gpu_w) {
 static int g_hotplug_settle = 0;
 static int g_keep_groups_target = -1;
 
-static void apply_hotplug(int aggression, double temp_c, double gpu_w) {
+static void apply_hotplug(int aggression, double temp_c, double gpu_w, bool weak_charger) {
     if (g_core_groups.empty()) return;
 
     if (g_hotplug_settle > 0) { g_hotplug_settle--; return; }
 
-    int target = compute_keep_groups(aggression, temp_c, gpu_w);
+    int target = compute_keep_groups(aggression, temp_c, gpu_w, weak_charger);
     target = std::max(target, 1);
     if (target == g_keep_groups_target) return;
 
@@ -428,6 +432,8 @@ static void save_cpu_state() {
         g_saved_epp = read_file(g_pcore_epp_paths[0]);
     g_saved_gt0_profile = GPU_GT0.empty() ? "" : read_file(GPU_GT0 + "/freq0/power_profile");
     g_saved_gt1_profile = GPU_GT1.empty() ? "" : read_file(GPU_GT1 + "/freq0/power_profile");
+    if (!GPU_GT0.empty()) read_attr(GPU_GT0 + "/freq0", "max_freq", g_saved_gt0_max_freq);
+    if (!GPU_GT1.empty()) read_attr(GPU_GT1 + "/freq0", "max_freq", g_saved_gt1_max_freq);
     g_saved_msr_1fc = msr_available() ? read_msr(0, 0x1FC) : 0;
     syslog(LOG_INFO, "saved state: max_perf=%d  min_perf=%d  no_turbo=%d  epp=%s",
            g_saved_max_perf, g_saved_min_perf, g_saved_no_turbo, g_saved_epp.c_str());
@@ -441,6 +447,8 @@ static void restore_cpu_state() {
         set_epp_legacy_all(g_saved_epp);
     if (!g_saved_gt0_profile.empty()) write_str(GPU_GT0 + "/freq0/power_profile", g_saved_gt0_profile);
     if (!g_saved_gt1_profile.empty()) write_str(GPU_GT1 + "/freq0/power_profile", g_saved_gt1_profile);
+    if (g_saved_gt0_max_freq > 0) write_int(GPU_GT0 + "/freq0/max_freq", g_saved_gt0_max_freq);
+    if (g_saved_gt1_max_freq > 0) write_int(GPU_GT1 + "/freq0/max_freq", g_saved_gt1_max_freq);
     if (g_saved_msr_1fc) write_msr(0, 0x1FC, g_saved_msr_1fc);
     syslog(LOG_INFO, "restored CPU and GPU state");
 }
@@ -563,12 +571,18 @@ static void track_perf_limits(PerfLimitCounters* pl, int cpu) {
 
 // ── Charger health ──
 // Detect insufficient charger conditions that cause EC PROCHOT assertion.
-static std::string check_charger_health() {
+struct ChargerInfo {
+    bool   weak       = false;
+    double max_watts  = 0;    // max delivered watts from USB-C PD contract
+    std::string note;          // human-readable description
+};
+
+static ChargerInfo check_charger() {
     bool ac_online = false;
-    std::string note;
+    ChargerInfo ci;
 
     DIR* dir = opendir("/sys/class/power_supply");
-    if (!dir) return "";
+    if (!dir) return ci;
     struct dirent* de;
     while ((de = readdir(dir)) != nullptr) {
         std::string name = de->d_name;
@@ -582,7 +596,8 @@ static std::string check_charger_health() {
         } else if (type.find("BAT") != std::string::npos) {
             std::string st = read_file(base + "/status");
             if (ac_online && (st == "Discharging" || st == "Not charging")) {
-                note = "insufficient charger: battery " + st;
+                ci.note = "insufficient charger: battery " + st;
+                ci.weak = true;
             }
         } else if (type.find("USB") != std::string::npos) {
             if (read_file(base + "/online") == "1") {
@@ -591,16 +606,18 @@ static std::string check_charger_health() {
                 read_attr(base, "voltage_max", vol_max);
                 if (vol_max > 0 && cur_max > 0) {
                     double max_w = (double)vol_max * cur_max / 1e12;
+                    ci.max_watts = std::max(ci.max_watts, max_w);
                     if (max_w > 0 && max_w < 45.0) {
-                        if (!note.empty()) note += "; ";
-                        note += std::to_string((int)max_w) + "W USB-C charger";
+                        if (!ci.note.empty()) ci.note += "; ";
+                        ci.note += std::to_string((int)max_w) + "W USB-C charger";
+                        ci.weak = true;
                     }
                 }
             }
         }
     }
     closedir(dir);
-    return note;
+    return ci;
 }
 
 // ── Temperature ──
@@ -873,6 +890,25 @@ int main(int argc, char** argv) {
         double max_temp = read_max_core_temp();
         ThermalConstraints thermal = compute_thermal(max_temp);
 
+        // ── Weak charger detection ──
+        static bool g_was_weak_charger = false;
+        static double g_charger_max_watts = 0;
+        static std::string g_charger_note;
+        bool weak_charger = g_was_weak_charger;
+        if (iterations % 20 == 10) {  // offset from logging cycle
+            ChargerInfo chg = check_charger();
+            weak_charger = chg.weak;
+            if (chg.max_watts > 0) g_charger_max_watts = chg.max_watts;
+            if (chg.weak) g_charger_note = chg.note;
+            if (weak_charger != g_was_weak_charger) {
+                if (weak_charger)
+                    syslog(LOG_WARNING, "weak charger: %s — enabling power saving", g_charger_note.c_str());
+                else
+                    syslog(LOG_INFO, "adequate charger detected — disabling power saving");
+                g_was_weak_charger = weak_charger;
+            }
+        }
+
         // ── Calculate CPU core budget ──
         // Principle: GPU gets unlimited budget (PP1 = 0 = disabled).
         // CPU (PP0) gets: PL1 - gpu_current_draw - headroom_margin
@@ -945,7 +981,9 @@ int main(int argc, char** argv) {
         // (except at critical temp >= 90°C where both get power)
         std::string p_val = "balance_performance";
         std::string e_val = "balance_performance";
-        if (aggression >= 2)       { p_val = "power";             e_val = "balance_power"; }
+        if (weak_charger) {
+            p_val = "power"; e_val = "power";
+        } else if (aggression >= 2)       { p_val = "power";             e_val = "balance_power"; }
         else if (aggression >= 1)  { p_val = "balance_power";     e_val = "balance_performance"; }
         if (thermal.epp_tier >= 2) { p_val = "power";             if (thermal.temp_c < 90.0) e_val = "balance_power"; else e_val = "power"; }
         else if (thermal.epp_tier >= 1) { p_val = "balance_power"; e_val = "balance_performance"; }
@@ -954,15 +992,62 @@ int main(int argc, char** argv) {
         // ── CPU hotplug (core offlining) ──
         // Drop min_perf to 0 when cores are offlined so remaining idle cores
         // can reach minimum frequency and deepest C-states.
-        apply_hotplug(aggression, thermal.temp_c, smoothed_gpu_w);
+        apply_hotplug(aggression, thermal.temp_c, smoothed_gpu_w, weak_charger);
         int min_perf = (g_keep_groups_target > 0 && g_keep_groups_target < (int)g_core_groups.size()) ? 0 : g_saved_min_perf;
         write_int(PSTATE_MIN, min_perf);
+
+        // ── Weak charger constraints ──
+        // Apply aggressive power saving when the charger can't keep up.
+        // These are applied AFTER all normal controls so they always win.
+        // On transition out of weak charger mode, restore GPU freq and uncore.
+        static bool g_gpu_freq_capped = false;
+        double effective_pl1_w = pl1_w;
+        if (weak_charger && g_charger_max_watts > 0) {
+            if (!g_gpu_freq_capped) g_gpu_freq_capped = true;
+
+            // Lower package PL1 to ~70% of charger capacity
+            double weak_pl1 = g_charger_max_watts * 0.7;
+            if (weak_pl1 < pl1_w) {
+                effective_pl1_w = weak_pl1;
+                write_int(PKG_DIR + "/constraint_0_power_limit_uw", (long long)(weak_pl1 * 1e6));
+                if (!PKG_MMIO_DIR.empty())
+                    write_int(PKG_MMIO_DIR + "/constraint_0_power_limit_uw", (long long)(weak_pl1 * 1e6));
+                double weak_budget = weak_pl1 - smoothed_gpu_w - headroom;
+                weak_budget = std::max(weak_budget, 0.0);
+                weak_budget = std::min(weak_budget, core_budget_w);
+                core_budget_w = weak_budget;
+                core_limit_r = round_to_125mw(core_budget_w);
+                if (have_core)
+                    write_int(CORE_DIR + "/constraint_0_power_limit_uw", (long long)(core_limit_r * 1e6));
+            }
+
+            no_turbo = 1;
+            write_int(PSTATE_NOTURBO, no_turbo);
+
+            max_perf = std::min(max_perf, 40);
+            write_int(PSTATE_MAX, max_perf);
+
+            write_int(PSTATE_MIN, 0);
+
+            if (!GPU_GT0.empty()) write_int(GPU_GT0 + "/freq0/max_freq", 900);
+            if (!GPU_GT1.empty()) write_int(GPU_GT1 + "/freq0/max_freq", 600);
+
+            if (have_uncore)
+                write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", (long long)(3.0 * 1e6));
+        } else if (g_gpu_freq_capped) {
+            g_gpu_freq_capped = false;
+            if (g_saved_gt0_max_freq > 0) write_int(GPU_GT0 + "/freq0/max_freq", g_saved_gt0_max_freq);
+            if (g_saved_gt1_max_freq > 0) write_int(GPU_GT1 + "/freq0/max_freq", g_saved_gt1_max_freq);
+            if (have_uncore)
+                write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
+        }
 
         // ── Log state changes ──
         if (aggression != last_aggression || iterations % 20 == 0) {
             const char* state = "idle";
             if (aggression == 1) state = "active";
             if (aggression == 2) state = "balance-throttle";
+            if (weak_charger) state = "power-save";
             // Build GPU throttle event summary
             std::string gpu_thr;
             if (have_gpu && gpu_tc.total_events > 0) {
@@ -988,9 +1073,9 @@ int main(int argc, char** argv) {
                 }
                 // PROCHOT active — check for root cause and warn if charger weak
                 if (current & 1) {
-                    std::string chg = check_charger_health();
-                    if (!chg.empty() && iterations - prochot_warn_cycle > 120) {
-                        syslog(LOG_WARNING, "PROCHOT asserted — %s", chg.c_str());
+                    ChargerInfo chg = check_charger();
+                    if (!chg.note.empty() && iterations - prochot_warn_cycle > 120) {
+                        syslog(LOG_WARNING, "PROCHOT asserted — %s", chg.note.c_str());
                         prochot_warn_cycle = iterations;
                     }
                 }
@@ -1006,7 +1091,7 @@ int main(int argc, char** argv) {
             syslog(LOG_INFO, "[%s] pkg=%.1fW core=%.1fW gpu=%.1fW(gpu_sm=%.1fW) "
                    "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s",
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
-                   pl1_w, core_limit_r, max_perf, no_turbo, epp_str.c_str(),
+                   effective_pl1_w, core_limit_r, max_perf, no_turbo, epp_str.c_str(),
                    temp_buf, throttle_summary.c_str());
             last_aggression = aggression;
         }
