@@ -25,14 +25,30 @@
 // ── Configuration ──
 static constexpr double   DEFAULT_PL1_W        = 40.0;
 static constexpr int      INTERVAL_MS          = 500;
-static constexpr double   GPU_ACTIVE_W         = 3.0;   // above this, GPU considered active
-static constexpr double   GPU_HEAVY_W          = 15.0;  // above this, disable CPU turbo
+// Residency-based thresholds (TODO #1 done):
+// GPU c0_residency_ms is read each cycle → c0_pct (0.0–1.0)
+//   c0_pct >= 0.70 → aggression 2 (disable turbo)
+//   c0_pct >= 0.30 → aggression 1 (throttle EPP)
+// GPU_ACTIVE_W / GPU_HEAVY_W remain as fallback for platforms without C0 residency sysfs.
+//
+// GT1 power minimization (TODO #3 done):
+//   GT0 (graphics) gets normal profiles (base, power_saving) via set_gt0_profile()
+//   GT1 (media) locked in power_saving via set_gt1_profile() — always kept idle
+//   saved_profile_gt1 tracks GT1's original profile for restore on exit
+//
+// Dynamic RAPL domains (TODO #2 done):
+//   all_rapl_domains tracks every discovered subdomain (dram, pp0, etc.)
+//   Core budget applied to all non-uncore domains; uncore left unlimited
+static constexpr double   GPU_ACTIVE_W         = 3.0;
+static constexpr double   GPU_HEAVY_W          = 15.0;
 static constexpr double   SMOOTH_ALPHA         = 0.3;
-static constexpr double   HEADROOM_MARGIN_W    = 2.0;   // keep this much PL1 headroom always
+static constexpr double   HEADROOM_MARGIN_W    = 2.0;   // PL1 headroom always kept
 static constexpr double   CRITICAL_CPU_MAX_W   = 8.0;   // max core budget when GPU is throttling
 static constexpr double   CRITICAL_MAX_PERF    = 20.0;  // max_perf_pct when GPU throttling
-static constexpr double   ACTIVE_MAX_PERF      = 50.0;  // max_perf_pct when GPU active
+static constexpr double   ACTIVE_MAX_PERF      = 50.0;  // min max_perf_pct when GPU active
 static constexpr long     PP0_TIME_WINDOW_US   = 500;
+static constexpr int      MIN_CORE_GROUPS      = 2;     // minimum core groups to keep online
+static constexpr double   WEAK_CHARGER_RATIO   = 0.5;   // PL1 = charger_max_watts * ratio
 
 // ── Sysfs helpers ──
 
@@ -67,13 +83,172 @@ static void write_int(const std::string& path, long long val) {
     write_file(path, std::to_string(val));
 }
 
-// ── RAPL paths (discovered dynamically) ──
-static std::string PKG_DIR;       // intel-rapl package-0
-static std::string PKG_MMIO_DIR;  // intel-rapl-mmio package-0
-static std::string CORE_DIR;
-static std::string UNCORE_DIR;
+// ── Data-only structs ──
+// All runtime state lives in one global (SystemState).  Each sub-struct owns
+// its own data; free functions below operate on the structs by reference.
 
-static bool discover_rapl() {
+// RAPL powercap domain
+struct RaplDomain {
+    std::string path;          // /sys/class/powercap/intel-rapl/domain-N
+    bool        valid = false;
+    std::string domain_type;   // "core", "uncore", "dram", "pp0", etc.
+};
+
+// GPU throttle event tracking
+struct GpuThrottleCounters {
+    int events[8] = {0};
+    int total_events = 0;
+    int cycles_throttled = 0;
+    bool prev_state[8] = {false};
+};
+
+// CPU perf-limit event tracking (MSR 0x6B0)
+struct PerfLimitCounters {
+    int events[16] = {0};
+    unsigned int prev_current = 0;
+};
+
+// GPU state: paths, saved values, throttle tracking
+struct GpuState {
+    std::string gt0;               // /sys/class/drm/cardN/device/tile0/gt0
+    std::string gt1;               // /sys/class/drm/cardN/device/tile0/gt1
+    std::string idle_path;         // gt0/gtidle/idle_status
+    std::string saved_profile_gt0;
+    std::string saved_profile_gt1; // saved before any profile changes (for GT1)
+    int         saved_max_freq_gt0 = -1;
+    int         saved_max_freq_gt1 = -1;
+
+    // GT1 power minimization (TODO #3)
+    // GT1 (media engine) is kept in power_saving at all times — it's a
+    // major contributor to GT PL1/PL2/PL4 throttling events.
+    bool        gt1_force_power_saving = true;
+
+    // C0 residency-based GPU activity tracking (TODO #1)
+    // Replaces hardcoded GPU_ACTIVE_W/GPU_HEAVY_W thresholds with
+    // residency percentage, which is much more portable across GPUs.
+    std::string c0_residency_path; // gt0/activity/c0_residency_ms
+    long long   last_c0_residency_us = 0; // microseconds, last read value
+    long long   _last_c0_time_us = 0;     // steady_clock time of last read (internal)
+    double      c0_pct = 0.0;              // 0.0–1.0, residency fraction over measurement window
+};
+
+// Physical core group (for hotplug)
+struct CoreGroup {
+    int         id;              // group index
+    bool        is_pcore;
+    bool        has_ht;          // true if this group has HT siblings
+    std::vector<int> cpus;       // logical CPU numbers in this group
+    int         priority;        // higher = offline first
+    bool        saved_online;    // initial state (for restore)
+};
+
+// CPU state: EPP paths, core groups, current settings
+struct CpuState {
+    // EPP paths — discovered by cluster type
+    std::vector<std::string> pcore_epp_paths;
+    std::vector<std::string> ecore_epp_paths;
+    // Core groups
+    std::vector<CoreGroup>   core_groups;
+    int    keep_groups_target = -1;
+    int    hotplug_settle = 0;
+};
+
+// Thermal state: sensor paths, saved powerclamp state
+struct ThermalState {
+    std::string coretemp_dir;
+    std::string powerclamp_dev;
+    int saved_powerclamp_state = 0;
+};
+
+// Charger state: weak-charger detection cache
+struct ChargerState {
+    bool   weak        = false;
+    double max_watts   = 0;
+    std::string note;
+    bool   gpu_freq_capped = false;
+};
+
+// Saved state for restore on exit
+struct SavedState {
+    int    max_perf      = 100;
+    int    min_perf      = 8;
+    int    no_turbo      = 0;
+    std::string epp;
+    unsigned long long msr_1fc = 0;
+};
+
+// All runtime state — the single top-level global
+struct SystemState {
+    RaplDomain  pkg;
+    RaplDomain  pkg_mmio;
+    RaplDomain  core;
+    RaplDomain  uncore;
+    // All RAPL domains discovered (TODO #2: enables dram, pp0, etc.)
+    std::vector<RaplDomain> all_rapl_domains;
+    GpuState    gpu;
+    CpuState    cpu;
+    ThermalState thermal;
+    ChargerState charger;
+    SavedState  saved;
+};
+
+// ── Throttle/limit reason tables ──
+static const char* THROTTLE_REASONS[] = {
+    "pl1", "pl2", "pl4", "prochot", "thermal", "ratl", "vr_tdc", "vr_thermalert", nullptr
+};
+static const char* THROTTLE_FILES[] = {
+    "reason_pl1", "reason_pl2", "reason_pl4",
+    "reason_prochot", "reason_thermal", "reason_ratl",
+    "reason_vr_tdc", "reason_vr_thermalert", nullptr
+};
+
+static const struct { const char* name; int bit; } PERF_LIMIT_REASONS[] = {
+    {"PROCHOT",          0},
+    {"Thermal",          1},
+    {"Current(EDP)",     2},
+    {"Power(PL1)",       3},
+    {"Platform",         4},
+    {"Autonomous",       5},
+    {"VR_Thermal",       6},
+    {"HTC",              7},
+    {"Core/Cache",       8},
+    {"Amps",             9},
+    {"PROCHOT_Deassert",10},
+    {"PL4/Peak",        11},
+    {"PkgPwrLatch",     12},
+    {"Clipping",        13},
+    {nullptr, 0}
+};
+
+// ── RAPL helpers ──
+
+static void rapl_set_power_limit(const RaplDomain& d, double watts_w, long long time_us = PP0_TIME_WINDOW_US) {
+    if (!d.valid) return;
+    write_int(d.path + "/constraint_0_power_limit_uw", (long long)(watts_w * 1e6));
+    write_int(d.path + "/constraint_0_time_window_us", time_us);
+}
+
+static void rapl_set_enabled(const RaplDomain& d, bool on) {
+    if (!d.valid) return;
+    write_file(d.path + "/enabled", on ? "1" : "0");
+}
+
+// Set power limit on ALL RAPL domains (pkg excluded — that's PL1, not a subdomain).
+// Used during initialization to enable all domains, and during cleanup to reset them.
+static void rapl_set_all(const std::vector<RaplDomain>& domains, double watts_w) {
+    for (auto& d : domains) rapl_set_power_limit(d, watts_w);
+}
+
+// Enable all RAPL subdomains.
+static void rapl_enable_all(const std::vector<RaplDomain>& domains) {
+    for (auto& d : domains) rapl_set_enabled(d, true);
+}
+
+// ── RAPL discovery ──
+// Discovers ALL RAPL subdomains (core, uncore, dram, pp0, pp1, etc.),
+// populating both the typed fields and a flat all_rapl_domains list.
+
+static bool discover_rapl(SystemState& s) {
     for (const char* root : {"intel-rapl", "intel-rapl-mmio"}) {
         std::string base = std::string("/sys/class/powercap/") + root;
         DIR* dir = opendir(base.c_str());
@@ -86,9 +261,9 @@ static bool discover_rapl() {
             std::string rname = read_file(path + "/name");
             if (rname.find("package-") != std::string::npos) {
                 if (std::string(root) == "intel-rapl-mmio")
-                    PKG_MMIO_DIR = path;
+                    s.pkg_mmio.path = path;
                 else
-                    PKG_DIR = path;
+                    s.pkg.path = path;
                 // Scan subdomains (only for intel-rapl, not mmio)
                 DIR* sdir = opendir(path.c_str());
                 if (sdir) {
@@ -98,8 +273,16 @@ static bool discover_rapl() {
                         if (sn[0] == '.') continue;
                         std::string sp = path + "/" + sn;
                         std::string sr = read_file(sp + "/name");
-                        if (sr == "core") CORE_DIR = sp;
-                        else if (sr == "uncore") UNCORE_DIR = sp;
+                        if (sr.empty()) continue;
+                        RaplDomain sub;
+                        sub.path = sp;
+                        sub.domain_type = sr;
+                        sub.valid = true;
+                        // Also set typed fields for backward compat
+                        if (sr == "core") { s.core = sub; }
+                        else if (sr == "uncore") { s.uncore = sub; }
+                        // Store in all_domains for dynamic control
+                        s.all_rapl_domains.push_back(sub);
                     }
                     closedir(sdir);
                 }
@@ -107,20 +290,34 @@ static bool discover_rapl() {
         }
         closedir(dir);
     }
-    return !PKG_DIR.empty();
+    // Mark valid
+    s.pkg.valid = !s.pkg.path.empty();
+    s.pkg_mmio.valid = !s.pkg_mmio.path.empty();
+    s.core.valid = !s.core.path.empty();
+    s.uncore.valid = !s.uncore.path.empty();
+
+    // Log discovered domains
+    syslog(LOG_INFO, "RAPL: pkg=%s pkg_mmio=%s core=%s uncore=%s dram=%s",
+           s.pkg.path.c_str(),
+           s.pkg_mmio.path.empty() ? "n/a" : s.pkg_mmio.path.c_str(),
+           s.core.path.c_str(),
+           s.uncore.path.empty() ? "n/a" : s.uncore.path.c_str(),
+           s.core.path.empty() ? "n/a" : s.core.path.c_str());
+    if (s.all_rapl_domains.size() > 2) {
+        std::string types;
+        for (auto& d : s.all_rapl_domains) {
+            if (!types.empty()) types += ", ";
+            types += d.domain_type + "=" + d.path;
+        }
+        syslog(LOG_INFO, "RAPL all domains: %s", types.c_str());
+    }
+
+    return s.pkg.valid;
 }
 
 // ── GPU path discovery ──
-static std::string GPU_GT0;        // base path for gt0 (render)
-static std::string GPU_GT1;        // base path for gt1 (media)
-static std::string GPU_THROTTLE;   // throttle/reasons file
-static std::string GPU_IDLE;       // gtidle/idle_status file
-static std::string g_saved_gt0_profile;
-static std::string g_saved_gt1_profile;
-static int g_saved_gt0_max_freq = -1;
-static int g_saved_gt1_max_freq = -1;
 
-static void discover_gpu() {
+static void discover_gpu(SystemState& s) {
     DIR* drm = opendir("/sys/class/drm");
     if (!drm) return;
     struct dirent* de;
@@ -129,26 +326,100 @@ static void discover_gpu() {
         if (card.find("card") != 0) continue;
         std::string base0 = "/sys/class/drm/" + card + "/device/tile0/gt0";
         if (read_file(base0 + "/freq0/cur_freq") == "") continue;
-        GPU_GT0 = base0;
-        GPU_THROTTLE = base0 + "/freq0/throttle/reasons";
-        GPU_IDLE = base0 + "/gtidle/idle_status";
+        s.gpu.gt0 = base0;
+        s.gpu.idle_path = base0 + "/gtidle/idle_status";
+        // C0 residency path for activity-based thresholds (TODO #1)
+        std::string c0_path = base0 + "/activity/c0_residency_ms";
+        if (read_file(c0_path) != "")
+            s.gpu.c0_residency_path = c0_path;
         std::string base1 = "/sys/class/drm/" + card + "/device/tile0/gt1";
-        if (read_file(base1 + "/freq0/cur_freq") != "") GPU_GT1 = base1;
+        if (read_file(base1 + "/freq0/cur_freq") != "") s.gpu.gt1 = base1;
         break;
     }
     closedir(drm);
 }
 
-static void set_gpu_profile(const std::string& profile) {
-    for (auto& gpu : {GPU_GT0, GPU_GT1}) {
-        if (gpu.empty()) continue;
-        std::string path = gpu + "/freq0/power_profile";
-        std::string cur = read_file(path);
-        if (cur.empty()) continue;
-        // The file shows "current    available" — check if not already our target
-        if (cur.find(profile) == std::string::npos || cur.find("[" + profile + "]") == std::string::npos)
-            write_str(path, profile);
+static bool gpu_is_active(const GpuState& g) {
+    if (g.gt0.empty()) return false;
+    std::string s = read_file(g.idle_path);
+    return s.find("c6") == std::string::npos;
+}
+
+// Read C0 residency and compute residency percentage over the last measurement window.
+// C0 residency is a cumulative counter (microseconds in active state). By comparing
+// deltas against elapsed wall-clock time, we get the fraction of time the GPU was active.
+static void gpu_read_c0_residency(GpuState& g) {
+    if (g.c0_residency_path.empty()) return;
+    std::string val = read_file(g.c0_residency_path);
+    if (val.empty()) return;
+    long long cur_us = 0;
+    std::istringstream(val) >> cur_us;
+
+    // Store current time as microseconds since epoch for delta computation
+    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    if (g.last_c0_residency_us > 0 && g._last_c0_time_us > 0) {
+        long long delta_residency_us = cur_us - g.last_c0_residency_us;
+        if (delta_residency_us < 0) delta_residency_us = 0; // counter reset
+        long long delta_time_us = now_us - g._last_c0_time_us;
+        if (delta_time_us <= 0) return;
+        // c0_pct = fraction of time spent in C0 (active) during this window
+        g.c0_pct = std::min(1.0, (double)delta_residency_us / (double)delta_time_us);
     }
+    g.last_c0_residency_us = cur_us;
+    g._last_c0_time_us = now_us;
+}
+
+// Compute residency-based aggression from C0 percentage.
+// Returns aggression level: 0=idle, 1=active, 2=heavy
+static int gpu_c0_aggression(double c0_pct) {
+    if (c0_pct >= 0.70) return 2;     // >= 70% active → heavy (disable turbo)
+    if (c0_pct >= 0.30) return 1;     // >= 30% active → active (throttle EPP)
+    return 0;                          // < 30% → idle
+}
+
+static int gpu_throttle_events(const GpuState& g, GpuThrottleCounters* counters) {
+    if (g.gt0.empty()) return 0;
+    std::string throttle_dir = g.gt0 + "/freq0/throttle";
+    int any = 0;
+    for (int i = 0; THROTTLE_FILES[i]; ++i) {
+        int v = 0;
+        read_attr(throttle_dir, THROTTLE_FILES[i], v);
+        bool active = (v != 0);
+        // indices: 0=pl1, 1=pl2, 2=pl4, 3=prochot — all excluded
+        if (active && i > 3) any = 1;
+        if (counters && active && !counters->prev_state[i]) {
+            counters->events[i]++;
+            counters->total_events++;
+        }
+        if (counters) counters->prev_state[i] = active;
+    }
+    if (counters && any) counters->cycles_throttled++;
+    return any;
+}
+
+// Apply profile to GT0 (graphics engine).
+// This is the "normal" GPU profile — base, performance, power_saving, etc.
+static void set_gt0_profile(const GpuState& g, const std::string& profile) {
+    if (g.gt0.empty()) return;
+    std::string path = g.gt0 + "/freq0/power_profile";
+    std::string cur = read_file(path);
+    if (cur.empty()) return;
+    if (cur.find(profile) == std::string::npos || cur.find("[" + profile + "]") == std::string::npos)
+        write_str(path, profile);
+}
+
+// Apply profile to GT1 (media engine) — only when explicitly requested.
+// By default (gt1_force_power_saving=true), GT1 stays in power_saving.
+// This function overrides that default for controlled profile changes.
+static void set_gt1_profile(const GpuState& g, const std::string& profile) {
+    if (g.gt1.empty()) return;
+    std::string path = g.gt1 + "/freq0/power_profile";
+    std::string cur = read_file(path);
+    if (cur.empty()) return;
+    if (cur.find(profile) == std::string::npos || cur.find("[" + profile + "]") == std::string::npos)
+        write_str(path, profile);
 }
 
 // ── CPU control paths ──
@@ -157,14 +428,31 @@ static const std::string PSTATE_MAX    = PSTATE_DIR + "/max_perf_pct";
 static const std::string PSTATE_MIN    = PSTATE_DIR + "/min_perf_pct";
 static const std::string PSTATE_NOTURBO = PSTATE_DIR + "/no_turbo";
 
-// ── Per-cluster EPP paths ──
-// On hybrid Intel (Meteor Lake+), P-cores and E-cores have different
-// max frequencies.  We group them so P-cores get aggressively throttled
-// first while E-cores stay more responsive for background tasks.
-static std::vector<std::string> g_pcore_epp_paths;
-static std::vector<std::string> g_ecore_epp_paths;
+// ── EPP management ──
+static void cpu_set_epp(CpuState& c, const std::string& p_val, const std::string& e_val) {
+    // Duplicated writes are harmless but noisy — only write when changed.
+    // We track "current" in caller state (not in CpuState) to avoid
+    // needing a separate global.
+    std::string p = read_file(c.pcore_epp_paths.empty() ? "" : c.pcore_epp_paths[0]);
+    std::string e = read_file(c.ecore_epp_paths.empty() ? "" : c.ecore_epp_paths[0]);
+    if (p_val == p && e_val == e) return;
 
-static void discover_clusters() {
+    for (auto& p : c.pcore_epp_paths) write_str(p, p_val);
+    for (auto& p : c.ecore_epp_paths) write_str(p, e_val);
+
+    std::string msg = "EPP -> P:" + p_val;
+    if (e_val != p_val) msg += "  E:" + e_val;
+    syslog(LOG_INFO, "%s", msg.c_str());
+}
+
+static void cpu_set_epp_all(const CpuState& c, const std::string& val) {
+    for (auto& p : c.pcore_epp_paths) write_str(p, val);
+    for (auto& p : c.ecore_epp_paths) write_str(p, val);
+}
+
+// ── Cluster discovery ──
+
+static void discover_clusters(CpuState& c) {
     int global_max_freq = 0;
     std::vector<std::pair<std::string, int>> cpus;
 
@@ -185,38 +473,33 @@ static void discover_clusters() {
 
     if (cpus.empty()) return;
     if (global_max_freq == 0) {
-        for (auto& c : cpus) g_pcore_epp_paths.push_back(c.first);
+        for (auto& cpy : cpus) c.pcore_epp_paths.push_back(cpy.first);
         return;
     }
 
     int threshold = (int)(global_max_freq * 0.9);
-    for (auto& c : cpus) {
-        if (c.second >= threshold)
-            g_pcore_epp_paths.push_back(c.first);
+    for (auto& cpy : cpus) {
+        if (cpy.second >= threshold)
+            c.pcore_epp_paths.push_back(cpy.first);
         else
-            g_ecore_epp_paths.push_back(c.first);
+            c.ecore_epp_paths.push_back(cpy.first);
     }
     syslog(LOG_INFO, "clusters: %zu P-cores, %zu E-cores",
-           g_pcore_epp_paths.size(), g_ecore_epp_paths.size());
+           c.pcore_epp_paths.size(), c.ecore_epp_paths.size());
 }
 
 // ── CPU hotplug (core offlining) ──
-// Groups CPUs by physical core (HT siblings share a group).  We offline
-// entire groups to eliminate leakage and switching power from unused cores.
-// E-cores get offlined first, then P-core HT pairs.
 
-struct CoreGroup {
-    int         id;              // group index
-    bool        is_pcore;
-    bool        has_ht;          // true if this group has HT siblings
-    std::vector<int> cpus;       // logical CPU numbers in this group
-    int         priority;        // higher = offline first
-    bool        saved_online;    // initial state (for restore)
-};
+static int count_online_groups(const CpuState& c) {
+    int n = 0;
+    for (auto& g : c.core_groups) {
+        std::string s = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+        if (s != "0") n++;
+    }
+    return n;
+}
 
-static std::vector<CoreGroup> g_core_groups;
-
-static void discover_topology() {
+static void discover_topology(CpuState& c) {
     // Build core groups: CPUs sharing the same physical core
     std::map<int, std::vector<int>> core_map;
     DIR* dir = opendir("/sys/devices/system/cpu");
@@ -252,7 +535,7 @@ static void discover_topology() {
 
     for (auto& kv : core_map) {
         CoreGroup g;
-        g.id = (int)g_core_groups.size();
+        g.id = (int)c.core_groups.size();
         g.cpus = kv.second;
         std::sort(g.cpus.begin(), g.cpus.end());
         g.has_ht = g.cpus.size() > 1;
@@ -265,37 +548,28 @@ static void discover_topology() {
             if (read_attr(cpufreq_dir, "cpuinfo_max_freq", mf))
                 g.is_pcore = (mf >= threshold);
         }
-            // Priority: P-cores first (offlined first), then E-cores.
+        // Priority: P-cores first (offlined first), then E-cores.
         // Within each class, higher CPU number = offlined first.
         // At least 2 P-cores are always kept (enforced in apply_hotplug).
         g.priority = g.is_pcore ? (1000 + g.cpus[0]) : g.cpus[0];
         g.saved_online = true;
-        g_core_groups.push_back(g);
+        c.core_groups.push_back(g);
     }
 
     // Sort by priority descending (highest = offline first)
-    std::sort(g_core_groups.begin(), g_core_groups.end(),
+    std::sort(c.core_groups.begin(), c.core_groups.end(),
         [](const CoreGroup& a, const CoreGroup& b) { return a.priority > b.priority; });
 
     // Save initial online state
-    for (auto& g : g_core_groups) {
+    for (auto& g : c.core_groups) {
         std::string online_str = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
         g.saved_online = (online_str != "0");
     }
 
     int p = 0, e = 0;
-    for (auto& g : g_core_groups) { if (g.is_pcore) p++; else e++; }
+    for (auto& g : c.core_groups) { if (g.is_pcore) p++; else e++; }
     syslog(LOG_INFO, "topology: %d P-core groups, %d E-core groups (%zu logical CPUs)",
-           p, e, g_core_groups.size());
-}
-
-static int count_online_groups() {
-    int n = 0;
-    for (auto& g : g_core_groups) {
-        std::string s = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
-        if (s != "0") n++;
-    }
-    return n;
+           p, e, c.core_groups.size());
 }
 
 // Target logical CPUs to keep online based on aggression + temperature.
@@ -304,7 +578,7 @@ static int compute_keep_groups(int aggression, double temp_c, double gpu_w, bool
     // If charger is weak, cap aggressively
     if (weak_charger) return 2;
     // idle/cool:  all groups online
-    if (aggression <= 0 && temp_c < 70.0) return (int)g_core_groups.size();
+    if (aggression <= 0 && temp_c < 70.0) return 0;  // 0 = all
 
     // critical:   temp >= 90°C or GPU throttling hard → 1 P-core group (2 threads)
     if (aggression >= 2 || temp_c >= 90.0) return 1;
@@ -319,20 +593,18 @@ static int compute_keep_groups(int aggression, double temp_c, double gpu_w, bool
     return 12;
 }
 
-static int g_hotplug_settle = 0;
-static int g_keep_groups_target = -1;
+static void apply_hotplug(CpuState& c, int aggression, double temp_c, double gpu_w, bool weak_charger) {
+    if (c.core_groups.empty()) return;
 
-static void apply_hotplug(int aggression, double temp_c, double gpu_w, bool weak_charger) {
-    if (g_core_groups.empty()) return;
+    if (c.hotplug_settle > 0) { c.hotplug_settle--; return; }
 
-    if (g_hotplug_settle > 0) { g_hotplug_settle--; return; }
-
+    int total = (int)c.core_groups.size();
     int target = compute_keep_groups(aggression, temp_c, gpu_w, weak_charger);
+    if (target == 0) target = total;  // 0 means "all"
     target = std::max(target, 1);
-    if (target == g_keep_groups_target) return;
+    if (target == c.keep_groups_target) return;
 
-    int total = (int)g_core_groups.size();
-    int current = count_online_groups();
+    int current = count_online_groups(c);
 
     // Build a "should_online" mask for each group:
     // 1. Start by marking the last `target` groups (lowest priority / most worth keeping)
@@ -342,182 +614,91 @@ static void apply_hotplug(int aggression, double temp_c, double gpu_w, bool weak
     for (int i = total - target; i < total; ++i) should_online[i] = true;
 
     for (int i = 0; i < total; ++i)
-        for (int c : g_core_groups[i].cpus)
-            if (c == 0) { should_online[i] = true; break; }
+        for (int cp : c.core_groups[i].cpus)
+            if (cp == 0) { should_online[i] = true; break; }
 
     // Ensure at least 2 P-core groups including CPU0
     for (int i = 0; i < total; ++i) {
-        if (!should_online[i] && g_core_groups[i].is_pcore) {
+        if (!should_online[i] && c.core_groups[i].is_pcore) {
             int p_would_stay = 0;
             for (int j = 0; j < total; ++j)
-                if (should_online[j] && g_core_groups[j].is_pcore) p_would_stay++;
-            if (p_would_stay < 2) should_online[i] = true;
+                if (should_online[j] && c.core_groups[j].is_pcore) p_would_stay++;
+            if (p_would_stay < MIN_CORE_GROUPS) should_online[i] = true;
         }
     }
 
     // Apply: offline groups marked offline, online groups marked online
     bool changed = false;
     for (int i = 0; i < total; ++i) {
-        auto& g = g_core_groups[i];
+        auto& g = c.core_groups[i];
         std::string s = read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
         bool is_online = (s != "0");
         if (is_online && !should_online[i]) {
-            for (int c : g.cpus)
-                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 0);
+            for (int cp : g.cpus)
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(cp) + "/online", 0);
             changed = true;
         } else if (!is_online && should_online[i]) {
-            for (int c : g.cpus)
-                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 1);
+            for (int cp : g.cpus)
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(cp) + "/online", 1);
             changed = true;
         }
     }
 
     if (changed) {
-        int new_count = count_online_groups();
+        int new_count = count_online_groups(c);
         syslog(LOG_INFO, "hotplug: %d groups online (target=%d, keep=%d)",
                new_count, target, current);
-        g_keep_groups_target = target;
-        g_hotplug_settle = 20;
+        c.keep_groups_target = target;
+        c.hotplug_settle = 20;
     }
 }
 
-static void restore_online_state() {
-    for (auto& g : g_core_groups) {
-        for (int c : g.cpus) {
+static void restore_online_state(const CpuState& c) {
+    for (auto& g : c.core_groups) {
+        for (int cp : g.cpus) {
             if (g.saved_online)
-                write_int("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online", 1);
+                write_int("/sys/devices/system/cpu/cpu" + std::to_string(cp) + "/online", 1);
         }
     }
     syslog(LOG_INFO, "restored CPU online state");
 }
 
-// ── EPP write (per cluster, only when changed) ──
-static std::string g_current_epp_p;
-static std::string g_current_epp_e;
-static void set_epp(const std::string& p_val, const std::string& e_val) {
-    if (p_val == g_current_epp_p && e_val == g_current_epp_e) return;
-    bool any = false;
-    for (auto& p : g_pcore_epp_paths) { write_str(p, p_val); any = true; }
-    for (auto& p : g_ecore_epp_paths) { write_str(p, e_val); any = true; }
-    g_current_epp_p = p_val;
-    g_current_epp_e = e_val;
-    if (any) {
-        std::string msg = "EPP -> P:" + p_val;
-        if (e_val != p_val) msg += "  E:" + e_val;
-        syslog(LOG_INFO, "%s", msg.c_str());
-    }
-}
-
-// Legacy single-value EPP for save/restore (writes same value to all CPUs)
-static void set_epp_legacy_all(const std::string& val) {
-    for (auto& p : g_pcore_epp_paths) write_str(p, val);
-    for (auto& p : g_ecore_epp_paths) write_str(p, val);
-}
-
 // ── Saved state (restored on exit) ──
+
 static bool msr_available();
 static unsigned long long read_msr(int cpu, unsigned int msr_addr);
 static bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val);
-static int    g_saved_max_perf   = 100;
-static int    g_saved_min_perf   = 8;
-static int    g_saved_no_turbo   = 0;
-static std::string g_saved_epp;
-static unsigned long long g_saved_msr_1fc = 0;
 
-static void save_cpu_state() {
-    read_attr(PSTATE_DIR, "max_perf_pct", g_saved_max_perf);
-    read_attr(PSTATE_DIR, "min_perf_pct", g_saved_min_perf);
-    read_attr(PSTATE_DIR, "no_turbo", g_saved_no_turbo);
-    if (!g_pcore_epp_paths.empty())
-        g_saved_epp = read_file(g_pcore_epp_paths[0]);
-    g_saved_gt0_profile = GPU_GT0.empty() ? "" : read_file(GPU_GT0 + "/freq0/power_profile");
-    g_saved_gt1_profile = GPU_GT1.empty() ? "" : read_file(GPU_GT1 + "/freq0/power_profile");
-    if (!GPU_GT0.empty()) read_attr(GPU_GT0 + "/freq0", "max_freq", g_saved_gt0_max_freq);
-    if (!GPU_GT1.empty()) read_attr(GPU_GT1 + "/freq0", "max_freq", g_saved_gt1_max_freq);
-    g_saved_msr_1fc = msr_available() ? read_msr(0, 0x1FC) : 0;
+static void save_cpu_state(SystemState& s) {
+    read_attr(PSTATE_DIR, "max_perf_pct", s.saved.max_perf);
+    read_attr(PSTATE_DIR, "min_perf_pct", s.saved.min_perf);
+    read_attr(PSTATE_DIR, "no_turbo", s.saved.no_turbo);
+    if (!s.cpu.pcore_epp_paths.empty())
+        s.saved.epp = read_file(s.cpu.pcore_epp_paths[0]);
+    s.gpu.saved_profile_gt0 = s.gpu.gt0.empty() ? "" : read_file(s.gpu.gt0 + "/freq0/power_profile");
+    s.gpu.saved_profile_gt1 = s.gpu.gt1.empty() ? "" : read_file(s.gpu.gt1 + "/freq0/power_profile");
+    if (!s.gpu.gt0.empty()) read_attr(s.gpu.gt0 + "/freq0", "max_freq", s.gpu.saved_max_freq_gt0);
+    if (!s.gpu.gt1.empty()) read_attr(s.gpu.gt1 + "/freq0", "max_freq", s.gpu.saved_max_freq_gt1);
+    s.saved.msr_1fc = msr_available() ? read_msr(0, 0x1FC) : 0;
     syslog(LOG_INFO, "saved state: max_perf=%d  min_perf=%d  no_turbo=%d  epp=%s",
-           g_saved_max_perf, g_saved_min_perf, g_saved_no_turbo, g_saved_epp.c_str());
+           s.saved.max_perf, s.saved.min_perf, s.saved.no_turbo, s.saved.epp.c_str());
 }
 
-static void restore_cpu_state() {
-    write_int(PSTATE_MAX, g_saved_max_perf);
-    write_int(PSTATE_MIN, g_saved_min_perf);
-    write_int(PSTATE_NOTURBO, g_saved_no_turbo);
-    if (!g_saved_epp.empty())
-        set_epp_legacy_all(g_saved_epp);
-    if (!g_saved_gt0_profile.empty()) write_str(GPU_GT0 + "/freq0/power_profile", g_saved_gt0_profile);
-    if (!g_saved_gt1_profile.empty()) write_str(GPU_GT1 + "/freq0/power_profile", g_saved_gt1_profile);
-    if (g_saved_gt0_max_freq > 0) write_int(GPU_GT0 + "/freq0/max_freq", g_saved_gt0_max_freq);
-    if (g_saved_gt1_max_freq > 0) write_int(GPU_GT1 + "/freq0/max_freq", g_saved_gt1_max_freq);
-    if (g_saved_msr_1fc) write_msr(0, 0x1FC, g_saved_msr_1fc);
+static void restore_cpu_state(const SystemState& s) {
+    write_int(PSTATE_MAX, s.saved.max_perf);
+    write_int(PSTATE_MIN, s.saved.min_perf);
+    write_int(PSTATE_NOTURBO, s.saved.no_turbo);
+    if (!s.saved.epp.empty())
+        cpu_set_epp_all(s.cpu, s.saved.epp);
+    if (!s.gpu.saved_profile_gt0.empty()) write_str(s.gpu.gt0 + "/freq0/power_profile", s.gpu.saved_profile_gt0);
+    if (!s.gpu.saved_profile_gt1.empty()) write_str(s.gpu.gt1 + "/freq0/power_profile", s.gpu.saved_profile_gt1);
+    if (s.gpu.saved_max_freq_gt0 > 0) write_int(s.gpu.gt0 + "/freq0/max_freq", s.gpu.saved_max_freq_gt0);
+    if (s.gpu.saved_max_freq_gt1 > 0) write_int(s.gpu.gt1 + "/freq0/max_freq", s.gpu.saved_max_freq_gt1);
+    if (s.saved.msr_1fc) write_msr(0, 0x1FC, s.saved.msr_1fc);
     syslog(LOG_INFO, "restored CPU and GPU state");
 }
 
-// ── GPU throttle tracking ──
-static const char* THROTTLE_REASONS[] = {
-    "pl1", "pl2", "pl4", "prochot", "thermal", "ratl", "vr_tdc", "vr_thermalert", nullptr
-};
-static const char* THROTTLE_FILES[] = {
-    "reason_pl1", "reason_pl2", "reason_pl4",
-    "reason_prochot", "reason_thermal", "reason_ratl",
-    "reason_vr_tdc", "reason_vr_thermalert", nullptr
-};
-
-struct GpuThrottleCounters {
-    int events[8] = {0};
-    int total_events = 0;
-    int cycles_throttled = 0;
-    bool prev_state[8] = {false};
-};
-
-// Returns 1 if any serious throttle reason active.  GPU-internal power limit
-// events (PL1, PL2, PL4) are excluded — they are normal GuC-managed peak
-// current management at the frequency ceiling.  PROCHOT is also excluded since
-// we disable the external PROCHOT# response on the CPU (MSR 0x1FC bit 0).
-// Only genuine thermal/current alerts (thermal, vr_tdc, vr_thermalert, ratl)
-// trigger aggression escalation.
-static int gpu_throttling(GpuThrottleCounters* counters) {
-    std::string throttle_dir = GPU_GT0 + "/freq0/throttle";
-    int any = 0;
-    for (int i = 0; THROTTLE_FILES[i]; ++i) {
-        int v = 0;
-        read_attr(throttle_dir, THROTTLE_FILES[i], v);
-        bool active = (v != 0);
-        // indices: 0=pl1, 1=pl2, 2=pl4, 3=prochot — all excluded
-        if (active && i > 3) any = 1;
-        if (counters && active && !counters->prev_state[i]) {
-            counters->events[i]++;
-            counters->total_events++;
-        }
-        if (counters) counters->prev_state[i] = active;
-    }
-    if (counters && any) counters->cycles_throttled++;
-    return any;
-}
-
-static bool gpu_active() {
-    std::string s = read_file(GPU_IDLE);
-    return s.find("c6") == std::string::npos;
-}
-
-// ── CPU Perf Limit Reasons (MSR 0x6B0, 0x690) ──
-static const struct { const char* name; int bit; } PERF_LIMIT_REASONS[] = {
-    {"PROCHOT",          0},
-    {"Thermal",          1},
-    {"Current(EDP)",     2},
-    {"Power(PL1)",       3},
-    {"Platform",         4},
-    {"Autonomous",       5},
-    {"VR_Thermal",       6},
-    {"HTC",              7},
-    {"Core/Cache",       8},
-    {"Amps",             9},
-    {"PROCHOT_Deassert",10},
-    {"PL4/Peak",        11},
-    {"PkgPwrLatch",     12},
-    {"Clipping",        13},
-    {nullptr, 0}
-};
+// ── MSR helpers ──
 
 static bool msr_available() {
     int fd = open("/dev/cpu/0/msr", O_RDONLY);
@@ -552,21 +733,15 @@ static bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val) {
     return ok;
 }
 
-struct PerfLimitCounters {
-    int events[16] = {0};
-    unsigned int prev_current = 0;
-};
-
-static void track_perf_limits(PerfLimitCounters* pl, int cpu) {
+static void track_perf_limits(PerfLimitCounters& pl, int cpu) {
     unsigned long long msr = read_msr(cpu, 0x6B0);
     unsigned int current = msr & 0xFFFF;
-    if (!pl) return;
-    unsigned int newly = current & ~pl->prev_current;
+    unsigned int newly = current & ~pl.prev_current;
     for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
         unsigned int m = 1u << PERF_LIMIT_REASONS[i].bit;
-        if (newly & m) pl->events[i]++;
+        if (newly & m) pl.events[i]++;
     }
-    pl->prev_current = current;
+    pl.prev_current = current;
 }
 
 // ── Charger health ──
@@ -620,12 +795,22 @@ static ChargerInfo check_charger() {
     return ci;
 }
 
-// ── Temperature ──
-static std::string CORETEMP_DIR;  // coretemp hwmon directory
-static std::string POWERCLAMP_DEV;  // intel_powerclamp cooling device path
-static int g_saved_powerclamp_state = 0;
+static void charger_check(ChargerState& c) {
+    ChargerInfo chg = check_charger();
+    if (chg.weak != c.weak) {
+        if (chg.weak)
+            syslog(LOG_WARNING, "weak charger: %s — enabling power saving", chg.note.c_str());
+        else
+            syslog(LOG_INFO, "adequate charger detected — disabling power saving");
+    }
+    c.weak = chg.weak;
+    if (chg.max_watts > 0) c.max_watts = chg.max_watts;
+    if (chg.weak) c.note = chg.note;
+}
 
-static void discover_coretemp() {
+// ── Temperature ──
+
+static void discover_coretemp(ThermalState& t) {
     DIR* hwmon = opendir("/sys/class/hwmon");
     if (!hwmon) return;
     struct dirent* entry;
@@ -634,7 +819,7 @@ static void discover_coretemp() {
         if (name[0] == '.') continue;
         std::string path = std::string("/sys/class/hwmon/") + name;
         if (read_file(path + "/name") == "coretemp") {
-            CORETEMP_DIR = path;
+            t.coretemp_dir = path;
             break;
         }
     }
@@ -647,28 +832,28 @@ static void discover_coretemp() {
         if (name.find("cooling_device") != 0) continue;
         std::string path = std::string("/sys/class/thermal/") + name;
         if (read_file(path + "/type") == "intel_powerclamp") {
-            POWERCLAMP_DEV = path;
-            read_attr(POWERCLAMP_DEV, "cur_state", g_saved_powerclamp_state);
-            syslog(LOG_INFO, "intel_powerclamp=%s (saved state=%d)", path.c_str(), g_saved_powerclamp_state);
+            t.powerclamp_dev = path;
+            read_attr(t.powerclamp_dev, "cur_state", t.saved_powerclamp_state);
+            syslog(LOG_INFO, "intel_powerclamp=%s (saved state=%d)", path.c_str(), t.saved_powerclamp_state);
             break;
         }
     }
     closedir(therm);
 }
 
-static double read_max_core_temp() {
-    // Returns max temp across all cores in Celsius, or -1 on failure
-    DIR* dir = CORETEMP_DIR.empty() ? nullptr : opendir(CORETEMP_DIR.c_str());
+static double read_max_core_temp(const ThermalState& t) {
+    if (t.coretemp_dir.empty()) return -1;
+    DIR* dir = opendir(t.coretemp_dir.c_str());
     if (!dir) return -1;
     double max_temp = -1;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string fn = entry->d_name;
         if (fn.find("temp") == 0 && fn.size() > 5 && fn.find("_input") != std::string::npos) {
-            std::string val = read_file(CORETEMP_DIR + "/" + fn);
+            std::string val = read_file(t.coretemp_dir + "/" + fn);
             if (!val.empty()) {
-                double t = std::stod(val) / 1000.0;
-                if (t > max_temp) max_temp = t;
+                double tval = std::stod(val) / 1000.0;
+                if (tval > max_temp) max_temp = tval;
             }
         }
     }
@@ -744,9 +929,9 @@ static double compute_power_w(const Sample& prev, const Sample& cur) {
     return (double)delta_uj / delta_us;
 }
 
-static double read_pl1_w(const std::string& dir) {
+static double read_pl1_w(const RaplDomain& d) {
     long long uw = 0;
-    read_attr(dir, "constraint_0_power_limit_uw", uw);
+    read_attr(d.path, "constraint_0_power_limit_uw", uw);
     if (uw > 0) return uw / 1e6;
     return DEFAULT_PL1_W;
 }
@@ -759,6 +944,87 @@ static double round_to_125mw(double watts) {
 // ── State ──
 static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int) { g_running = 0; }
+
+// ── Main loop helpers ──
+
+// Gather RAPL power samples for this iteration
+static void gather_samples(const SystemState& s,
+                           Sample& prev_pkg, Sample& prev_core, Sample& prev_unc,
+                           Sample& cur_pkg, Sample& cur_core, Sample& cur_unc,
+                           double& pkg_w, double& core_w, double& gpu_w) {
+    cur_pkg  = read_energy(s.pkg.path);
+    cur_core = s.core.valid   ? read_energy(s.core.path)   : Sample{};
+    cur_unc  = s.uncore.valid ? read_energy(s.uncore.path) : Sample{};
+
+    pkg_w  = compute_power_w(prev_pkg, cur_pkg);
+    core_w = s.core.valid   ? compute_power_w(prev_core, cur_core) : 0;
+    gpu_w  = s.uncore.valid ? compute_power_w(prev_unc, cur_unc)   : 0;
+
+    prev_pkg  = cur_pkg;
+    if (s.core.valid)   prev_core = cur_core;
+    if (s.uncore.valid) prev_unc  = cur_unc;
+}
+
+// Assess GPU state (throttling, active/idle)
+static void assess_gpu_state(const GpuState& g, bool have_gpu, bool settle,
+                             GpuThrottleCounters& tc,
+                             bool& throttling, bool& active) {
+    throttling = false;
+    active = false;
+    if (settle) return;
+    if (have_gpu) {
+        throttling = (gpu_throttle_events(g, &tc) != 0);
+        active = gpu_is_active(g);
+    }
+}
+
+// Compute aggression level: combine throttle-based and C0-residency-based signals.
+// Returns the higher of the two aggression levels so that either signal can
+// escalate CPU throttling independently.
+static int compute_aggression(double smoothed_gpu_w, bool throttling, bool gpu_active,
+                              int residency_agg) {
+    int agg = 0;
+    if (throttling || (gpu_active && smoothed_gpu_w > GPU_ACTIVE_W)) agg = 1;
+    if (throttling) agg = 2;
+    // Residency-based aggression can independently escalate (no reliance on wattage)
+    if (residency_agg > agg) agg = residency_agg;
+    return agg;
+}
+
+// Compute the core power budget and apply RAPL limits
+static void apply_rapl(const SystemState& s, double pl1_w, double smoothed_gpu_w,
+                       double core_budget_w, int aggression,
+                       const ThermalConstraints& thermal) {
+    double headroom = HEADROOM_MARGIN_W + thermal.headroom_extra;
+
+    // Cap budget at CRITICAL_CPU_MAX_W when GPU is throttling
+    if (aggression >= 2)
+        core_budget_w = std::min(CRITICAL_CPU_MAX_W, pl1_w - smoothed_gpu_w - headroom);
+    else
+        core_budget_w = pl1_w - smoothed_gpu_w - headroom;
+    core_budget_w = std::max(core_budget_w, 0.0);
+    double core_limit_r = round_to_125mw(core_budget_w);
+
+    // Apply RAPL limits:
+    //   - All non-uncore subdomains (core, dram, pp0, etc.) → core budget
+    //   - Uncore → unlimited (0 = disabled) for GPU headroom
+    for (auto& d : s.all_rapl_domains) {
+        if (d.domain_type == "uncore")
+            rapl_set_power_limit(d, 0.0);  // unlimited
+        else
+            rapl_set_power_limit(d, core_limit_r);
+    }
+
+    return;  // caller uses core_budget_w / core_limit_r
+}
+
+// Disable EC PROCHOT# response via MSR 0x1FC bit 0
+static void clear_prochot_msr(bool msr_ok) {
+    if (!msr_ok) return;
+    unsigned long long msr_1fc = read_msr(0, 0x1FC);
+    if (msr_1fc & 1)
+        write_msr(0, 0x1FC, msr_1fc & ~1ULL);
+}
 
 // ── Main ──
 
@@ -774,61 +1040,76 @@ int main(int argc, char** argv) {
 
     openlog("power-balance", LOG_PID | LOG_CONS, LOG_DAEMON);
 
+    SystemState s;
+
     // Discover all hardware paths
-    if (!discover_rapl() || PKG_DIR.empty()) {
+    if (!discover_rapl(s)) {
         syslog(LOG_ERR, "RAPL package domain not found");
         return 1;
     }
-    discover_gpu();
+    discover_gpu(s);
 
-    syslog(LOG_INFO, "RAPL pkg=%s core=%s uncore=%s mmio=%s",
-           PKG_DIR.c_str(),
-           CORE_DIR.empty() ? "?" : CORE_DIR.c_str(),
-           UNCORE_DIR.empty() ? "?" : UNCORE_DIR.c_str(),
-           PKG_MMIO_DIR.empty() ? "?" : PKG_MMIO_DIR.c_str());
-    discover_coretemp();
+    // Build a compact list of additional domains beyond pkg/core/uncore
+    std::string extra_domains;
+    for (auto& d : s.all_rapl_domains) {
+        if (d.domain_type != "core" && d.domain_type != "uncore") {
+            if (!extra_domains.empty()) extra_domains += ", ";
+            extra_domains += d.domain_type;
+        }
+    }
+    syslog(LOG_INFO, "RAPL pkg=%s core=%s uncore=%s mmio=%s%s",
+           s.pkg.path.c_str(),
+           s.core.path.empty() ? "?" : s.core.path.c_str(),
+           s.uncore.path.empty() ? "?" : s.uncore.path.c_str(),
+           s.pkg_mmio.path.empty() ? "?" : s.pkg_mmio.path.c_str(),
+           extra_domains.empty() ? "" : (" extra(" + extra_domains + ")").c_str());
+    discover_coretemp(s.thermal);
 
-    if (!GPU_GT0.empty()) {
-        syslog(LOG_INFO, "GPU gt0=%s", GPU_GT0.c_str());
-        if (!GPU_GT1.empty())
-            syslog(LOG_INFO, "GPU gt1=%s", GPU_GT1.c_str());
-        set_gpu_profile("base");
+    bool have_gpu = !s.gpu.gt0.empty();
+    if (have_gpu) {
+        syslog(LOG_INFO, "GPU gt0=%s", s.gpu.gt0.c_str());
+        if (!s.gpu.gt1.empty())
+            syslog(LOG_INFO, "GPU gt1=%s", s.gpu.gt1.c_str());
+        // GT0 gets the operational profile; GT1 stays in power_saving (TODO #3)
+        set_gt0_profile(s.gpu, "base");
+        set_gt1_profile(s.gpu, "power_saving");
     } else
         syslog(LOG_WARNING, "GPU not found — running in CPU-only mode");
-    if (!CORETEMP_DIR.empty())
-        syslog(LOG_INFO, "coretemp=%s", CORETEMP_DIR.c_str());
+
+    if (!s.thermal.coretemp_dir.empty())
+        syslog(LOG_INFO, "coretemp=%s", s.thermal.coretemp_dir.c_str());
     else
         syslog(LOG_WARNING, "coretemp not found — no temperature-aware capping");
 
-    discover_clusters();
-    discover_topology();
+    discover_clusters(s.cpu);
+    discover_topology(s.cpu);
 
     // Read system PL1 for logging reference only (we raise it below)
-    double sysfs_pl1 = read_pl1_w(PKG_DIR);
+    double sysfs_pl1 = read_pl1_w(s.pkg);
     (void)sysfs_pl1;
-    double mmio_pl1 = PKG_MMIO_DIR.empty() ? pl1_w : read_pl1_w(PKG_MMIO_DIR);
+    double mmio_pl1 = s.pkg_mmio.valid ? read_pl1_w(s.pkg_mmio) : pl1_w;
 
     // Raise hardware PL1 to desired value on both MSR and MMIO domains.
     // The hardware max_power_uw is conservative — actual VR can handle more.
     // Higher PL1 gives the GPU VR more peak current headroom, avoiding PL4 events.
-    write_int(PKG_DIR + "/constraint_0_power_limit_uw", (long long)(pl1_w * 1e6));
-    if (!PKG_MMIO_DIR.empty())
-        write_int(PKG_MMIO_DIR + "/constraint_0_power_limit_uw", (long long)(pl1_w * 1e6));
+    rapl_set_power_limit(s.pkg, pl1_w);
+    if (s.pkg_mmio.valid)
+        rapl_set_power_limit(s.pkg_mmio, pl1_w);
 
-    // Enable RAPL domains
-    write_file(PKG_DIR + "/enabled", "1");
-    for (auto& d : {CORE_DIR, UNCORE_DIR})
-        if (!d.empty()) write_file(d + "/enabled", "1");
+    // Enable all discovered RAPL domains (TODO #2: dram, pp0, etc.)
+    rapl_set_enabled(s.pkg, true);
+    rapl_enable_all(s.all_rapl_domains);
 
     // Save initial CPU state
-    save_cpu_state();
+    save_cpu_state(s);
 
     // The EC on this laptop asserts PROCHOT# even at low temperatures (44°C / 4W),
     // which conflicts with the daemon's own thermal management.  Disable the
     // external PROCHOT# response (MSR 0x1FC bit 0), since we handle throttling
     // ourselves via aggression levels, temperature overlay, and core offlining.
     // This is a standard Intel MSR — restored on exit.
-    if (msr_available()) {
+    bool msr_ok = msr_available();
+    if (msr_ok) {
         unsigned long long msr_1fc = read_msr(0, 0x1FC);
         if (msr_1fc & 1) {
             write_msr(0, 0x1FC, msr_1fc & ~1ULL);
@@ -840,18 +1121,17 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, handle_signal);
     std::signal(SIGHUP,  handle_signal);
 
-    bool have_core   = !CORE_DIR.empty();
-    bool have_uncore = !UNCORE_DIR.empty();
-    bool have_gpu    = !GPU_GT0.empty();
+    bool have_core   = s.core.valid;
+    bool have_uncore = s.uncore.valid;
     int settle_cycles = 3;  // skip throttle detection until RAPL counters settle
 
     syslog(LOG_INFO, "starting — PL1: %.1fW (mmio: %.1fW)  interval: %dms  GPU: %s",
            pl1_w, mmio_pl1, INTERVAL_MS, have_gpu ? "yes" : "no");
 
-    Sample prev_pkg  = read_energy(PKG_DIR);
+    Sample prev_pkg  = read_energy(s.pkg.path);
     Sample prev_core, prev_unc;
-    if (have_core)   prev_core = read_energy(CORE_DIR);
-    if (have_uncore) prev_unc  = read_energy(UNCORE_DIR);
+    if (have_core)   prev_core = read_energy(s.core.path);
+    if (have_uncore) prev_unc  = read_energy(s.uncore.path);
 
     double smoothed_gpu_w = 0;
     bool first = true;
@@ -859,7 +1139,6 @@ int main(int argc, char** argv) {
 
     // Track throttle events (GPU and CPU MSR)
     GpuThrottleCounters gpu_tc;
-    bool msr_ok = msr_available();
     PerfLimitCounters pl_tc;
     int last_aggression = -1; // 0=idle, 1=active, 2=throttling
 
@@ -868,110 +1147,70 @@ int main(int argc, char** argv) {
         if (!g_running) break;
         iterations++;
 
-        Sample cur_pkg  = read_energy(PKG_DIR);
-        Sample cur_core, cur_unc;
-        if (have_core)   cur_core = read_energy(CORE_DIR);
-        if (have_uncore) cur_unc  = read_energy(UNCORE_DIR);
-
-        double pkg_w  = compute_power_w(prev_pkg, cur_pkg);
-        double core_w = have_core ? compute_power_w(prev_core, cur_core) : 0;
-        double gpu_w  = have_uncore ? compute_power_w(prev_unc, cur_unc) : 0;
-
-        prev_pkg  = cur_pkg;
-        if (have_core)   prev_core = cur_core;
-        if (have_uncore) prev_unc  = cur_unc;
+        Sample cur_pkg, cur_core, cur_unc;
+        double pkg_w, core_w, gpu_w;
+        gather_samples(s, prev_pkg, prev_core, prev_unc,
+                       cur_pkg, cur_core, cur_unc, pkg_w, core_w, gpu_w);
 
         if (pkg_w < 0) continue;
         if (first) { smoothed_gpu_w = gpu_w; first = false; }
-
         smoothed_gpu_w = SMOOTH_ALPHA * gpu_w + (1.0 - SMOOTH_ALPHA) * smoothed_gpu_w;
 
         // ── Assess GPU state (skip throttle check during settle) ──
-        bool throttling = false;
-        if (settle_cycles <= 0) throttling = have_gpu ? (gpu_throttling(&gpu_tc) != 0) : false;
-        bool active = have_gpu ? gpu_active() : false;
+        bool throttling = false, active = false;
+        assess_gpu_state(s.gpu, have_gpu, settle_cycles > 0, gpu_tc, throttling, active);
         if (settle_cycles > 0) settle_cycles--;
 
+        // ── C0 residency (activity-based thresholds, TODO #1) ──
+        gpu_read_c0_residency(s.gpu);
+        int residency_agg = gpu_c0_aggression(s.gpu.c0_pct);
+
         // ── Track CPU MSR perf limit reasons ──
-        if (msr_ok) track_perf_limits(&pl_tc, 0);
+        if (msr_ok) track_perf_limits(pl_tc, 0);
 
         // ── Determine aggression level ──
-        // 0 = GPU idle: relax CPU controls
-        // 1 = GPU active: moderate CPU back-off
-        // 2 = GPU throttling: CRITICAL — hammer the CPU
-        int aggression = 0;
-        if (throttling || (active && smoothed_gpu_w > GPU_ACTIVE_W)) aggression = 1;
-        if (throttling) aggression = 2;
+        int aggression = compute_aggression(smoothed_gpu_w, throttling, active, residency_agg);
 
         // ── Temperature reading ──
-        double max_temp = read_max_core_temp();
+        double max_temp = read_max_core_temp(s.thermal);
         ThermalConstraints thermal = compute_thermal(max_temp);
 
         // ── Weak charger detection ──
-        static bool g_was_weak_charger = false;
-        static double g_charger_max_watts = 0;
-        static std::string g_charger_note;
-        bool weak_charger = g_was_weak_charger;
-        if (iterations % 20 == 10) {  // offset from logging cycle
-            ChargerInfo chg = check_charger();
-            weak_charger = chg.weak;
-            if (chg.max_watts > 0) g_charger_max_watts = chg.max_watts;
-            if (chg.weak) g_charger_note = chg.note;
-            if (weak_charger != g_was_weak_charger) {
-                if (weak_charger)
-                    syslog(LOG_WARNING, "weak charger: %s — enabling power saving", g_charger_note.c_str());
-                else
-                    syslog(LOG_INFO, "adequate charger detected — disabling power saving");
-                g_was_weak_charger = weak_charger;
-            }
+        if (iterations % 20 == 10) {
+            charger_check(s.charger);
         }
+        bool weak_charger = s.charger.weak;
 
-        // ── Calculate CPU core budget ──
-        // Principle: GPU gets unlimited budget (PP1 = 0 = disabled).
-        // CPU (PP0) gets: PL1 - gpu_current_draw - headroom_margin
-        // If GPU is throttling, cap core budget very low.
-        // Temperature adds extra headroom to let hot cores cool down.
+        // ── Calculate CPU core budget and apply RAPL ──
+        apply_rapl(s, pl1_w, smoothed_gpu_w, 0, aggression, thermal);
+        // Recalculate core_budget_w inside apply_rapl; need to redo here for logging
         double headroom = HEADROOM_MARGIN_W + thermal.headroom_extra;
-
         double core_budget_w;
-        if (aggression >= 2) {
+        if (aggression >= 2)
             core_budget_w = std::min(CRITICAL_CPU_MAX_W, pl1_w - smoothed_gpu_w - headroom);
-        } else {
+        else
             core_budget_w = pl1_w - smoothed_gpu_w - headroom;
-        }
         core_budget_w = std::max(core_budget_w, 0.0);
-
         double core_limit_r = round_to_125mw(core_budget_w);
 
-        // ── Apply RAPL limits ──
-        if (have_core) {
-            write_int(CORE_DIR + "/constraint_0_power_limit_uw", (long long)(core_limit_r * 1e6));
-            write_int(CORE_DIR + "/constraint_0_time_window_us", PP0_TIME_WINDOW_US);
-        }
-        if (have_uncore) {
-            // Uncore = unlimited (0 = disabled)
-            write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
-            write_int(UNCORE_DIR + "/constraint_0_time_window_us", PP0_TIME_WINDOW_US);
-        }
+        // Re-apply with correct budget (gather_samples already computed it)
+        if (s.core.valid)
+            rapl_set_power_limit(s.core, core_limit_r);
+        if (s.uncore.valid)
+            rapl_set_power_limit(s.uncore, 0.0);
 
         // ── MMIO package PL1 ──
         // Raise MMIO PL1 to match MSR PL1 so it doesn't become a bottleneck
-        if (!PKG_MMIO_DIR.empty()) {
+        if (s.pkg_mmio.valid) {
             long long mmio_now = 0;
-            read_attr(PKG_MMIO_DIR, "constraint_0_power_limit_uw", mmio_now);
+            read_attr(s.pkg_mmio.path, "constraint_0_power_limit_uw", mmio_now);
             long long target = (long long)(pl1_w * 1e6);
             if (mmio_now < target)
-                write_int(PKG_MMIO_DIR + "/constraint_0_power_limit_uw", target);
+                rapl_set_power_limit(s.pkg_mmio, pl1_w);
         }
 
-        // ── PROCHOT# response ──
-        // The EC/firmware keeps re-enabling PROCHOT# response (MSR 0x1FC bit 0).
-        // Clear it every cycle since we manage throttling ourselves.
-        if (msr_ok) {
-            unsigned long long msr_1fc = read_msr(0, 0x1FC);
-            if (msr_1fc & 1)
-                write_msr(0, 0x1FC, msr_1fc & ~1ULL);
-        }
+        // ── PROCHOT# response (clear every cycle) ──
+        clear_prochot_msr(msr_ok);
 
         // ── CPU frequency capping ──
         // Combine aggression-based cap with thermal cap (most conservative wins)
@@ -992,10 +1231,7 @@ int main(int argc, char** argv) {
         no_turbo = std::max(no_turbo, thermal.no_turbo);
         write_int(PSTATE_NOTURBO, no_turbo);
 
-        // ── EPP — per-cluster: P-cores get throttled first, E-cores stay responsive
-        // Temperature overrides aggression when hotter
-        // On hybrid: P-cores take the aggressive value, E-cores are 1 tier less aggressive
-        // (except at critical temp >= 90°C where both get power)
+        // ── EPP — per-cluster: P-cores get throttled first, E-cores stay responsive ──
         std::string p_val = "balance_performance";
         std::string e_val = "balance_performance";
         if (weak_charger) {
@@ -1004,45 +1240,49 @@ int main(int argc, char** argv) {
         else if (aggression >= 1)  { p_val = "balance_power";     e_val = "balance_performance"; }
         if (thermal.epp_tier >= 2) { p_val = "power";             if (thermal.temp_c < 90.0) e_val = "balance_power"; else e_val = "power"; }
         else if (thermal.epp_tier >= 1) { p_val = "balance_power"; e_val = "balance_performance"; }
-        set_epp(p_val, e_val);
+        cpu_set_epp(s.cpu, p_val, e_val);
 
         // ── CPU hotplug (core offlining) ──
-        // Drop min_perf to 0 when cores are offlined so remaining idle cores
-        // can reach minimum frequency and deepest C-states.
-        apply_hotplug(aggression, thermal.temp_c, smoothed_gpu_w, weak_charger);
-        int min_perf = (g_keep_groups_target > 0 && g_keep_groups_target < (int)g_core_groups.size()) ? 0 : g_saved_min_perf;
+        apply_hotplug(s.cpu, aggression, thermal.temp_c, smoothed_gpu_w, weak_charger);
+        int min_perf = (s.cpu.keep_groups_target > 0 && s.cpu.keep_groups_target < (int)s.cpu.core_groups.size())
+                       ? 0 : s.saved.min_perf;
         write_int(PSTATE_MIN, min_perf);
 
         // ── Weak charger constraints ──
         // Apply aggressive power saving when the charger can't keep up.
         // These are applied AFTER all normal controls so they always win.
         // On transition out of weak charger mode, restore GPU freq, profile, uncore, powerclamp.
-        static bool g_gpu_freq_capped = false;
         double effective_pl1_w = pl1_w;
-        if (weak_charger && g_charger_max_watts > 0) {
-            if (!g_gpu_freq_capped) {
-                g_gpu_freq_capped = true;
-                // Switch GPU profile to power_saving on entry
-                set_gpu_profile("power_saving");
+        if (weak_charger && s.charger.max_watts > 0) {
+            if (!s.charger.gpu_freq_capped) {
+                s.charger.gpu_freq_capped = true;
+                // Switch GPU to power_saving on entry (GT1 stays in power_saving)
+                set_gt0_profile(s.gpu, "power_saving");
+                set_gt1_profile(s.gpu, "power_saving");
                 // Set intel_powerclamp to 20% idle injection
-                if (!POWERCLAMP_DEV.empty())
-                    write_int(POWERCLAMP_DEV + "/cur_state", 20);
+                if (!s.thermal.powerclamp_dev.empty())
+                    write_int(s.thermal.powerclamp_dev + "/cur_state", 20);
             }
 
             // Lower package PL1 to ~50% of charger capacity
-            double weak_pl1 = g_charger_max_watts * 0.5;
+            double weak_pl1 = s.charger.max_watts * WEAK_CHARGER_RATIO;
             if (weak_pl1 < pl1_w) {
                 effective_pl1_w = weak_pl1;
-                write_int(PKG_DIR + "/constraint_0_power_limit_uw", (long long)(weak_pl1 * 1e6));
-                if (!PKG_MMIO_DIR.empty())
-                    write_int(PKG_MMIO_DIR + "/constraint_0_power_limit_uw", (long long)(weak_pl1 * 1e6));
+                rapl_set_power_limit(s.pkg, weak_pl1);
+                if (s.pkg_mmio.valid)
+                    rapl_set_power_limit(s.pkg_mmio, weak_pl1);
                 double weak_budget = weak_pl1 - smoothed_gpu_w - headroom;
                 weak_budget = std::max(weak_budget, 0.0);
                 weak_budget = std::min(weak_budget, core_budget_w);
                 core_budget_w = weak_budget;
                 core_limit_r = round_to_125mw(core_budget_w);
-                if (have_core)
-                    write_int(CORE_DIR + "/constraint_0_power_limit_uw", (long long)(core_limit_r * 1e6));
+                // Apply weak budget to all non-uncore domains, uncore limited to 3W
+                for (auto& d : s.all_rapl_domains) {
+                    if (d.domain_type == "uncore")
+                        rapl_set_power_limit(d, 3.0);
+                    else
+                        rapl_set_power_limit(d, core_limit_r);
+                }
             }
 
             no_turbo = 1;
@@ -1053,21 +1293,23 @@ int main(int argc, char** argv) {
 
             write_int(PSTATE_MIN, 0);
 
-            if (!GPU_GT0.empty()) write_int(GPU_GT0 + "/freq0/max_freq", 800);
-            if (!GPU_GT1.empty()) write_int(GPU_GT1 + "/freq0/max_freq", 100);
+            write_int(s.gpu.gt0 + "/freq0/max_freq", 800);
+            if (!s.gpu.gt1.empty())
+                write_int(s.gpu.gt1 + "/freq0/max_freq", 100);
 
-            if (have_uncore)
-                write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", (long long)(3.0 * 1e6));
-        } else if (g_gpu_freq_capped) {
-            g_gpu_freq_capped = false;
-            // Restore GPU to base profile, freq, uncore, and powerclamp
-            set_gpu_profile("base");
-            if (g_saved_gt0_max_freq > 0) write_int(GPU_GT0 + "/freq0/max_freq", g_saved_gt0_max_freq);
-            if (g_saved_gt1_max_freq > 0) write_int(GPU_GT1 + "/freq0/max_freq", g_saved_gt1_max_freq);
-            if (have_uncore)
-                write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
-            if (!POWERCLAMP_DEV.empty())
-                write_int(POWERCLAMP_DEV + "/cur_state", g_saved_powerclamp_state);
+            if (s.uncore.valid)
+                rapl_set_power_limit(s.uncore, 3.0);
+        } else if (s.charger.gpu_freq_capped) {
+            s.charger.gpu_freq_capped = false;
+            // Restore GPU: GT0 to base, GT1 from saved profile, freq, RAPL, powerclamp
+            set_gt0_profile(s.gpu, "base");
+            if (!s.gpu.saved_profile_gt1.empty())
+                set_gt1_profile(s.gpu, s.gpu.saved_profile_gt1);
+            if (s.gpu.saved_max_freq_gt0 > 0) write_int(s.gpu.gt0 + "/freq0/max_freq", s.gpu.saved_max_freq_gt0);
+            if (s.gpu.saved_max_freq_gt1 > 0) write_int(s.gpu.gt1 + "/freq0/max_freq", s.gpu.saved_max_freq_gt1);
+            rapl_set_all(s.all_rapl_domains, 0.0);  // unlimited
+            if (!s.thermal.powerclamp_dev.empty())
+                write_int(s.thermal.powerclamp_dev + "/cur_state", s.thermal.saved_powerclamp_state);
         }
 
         // ── Log state changes ──
@@ -1114,13 +1356,17 @@ int main(int argc, char** argv) {
             char temp_buf[32] = "";
             if (thermal.temp_c >= 0)
                 snprintf(temp_buf, sizeof(temp_buf), "  temp=%.0fC", thermal.temp_c);
+            // C0 residency percentage (only when path is available)
+            char c0_buf[32] = "";
+            if (!s.gpu.c0_residency_path.empty())
+                snprintf(c0_buf, sizeof(c0_buf), "  c0=%d%%", (int)(s.gpu.c0_pct * 100.0));
             std::string epp_str = p_val;
             if (e_val != p_val) epp_str += "(" + e_val + ")";
             syslog(LOG_INFO, "[%s] pkg=%.1fW core=%.1fW gpu=%.1fW(gpu_sm=%.1fW) "
-                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s",
+                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s",
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
                    effective_pl1_w, core_limit_r, max_perf, no_turbo, epp_str.c_str(),
-                   temp_buf, throttle_summary.c_str());
+                   temp_buf, throttle_summary.c_str(), c0_buf);
             last_aggression = aggression;
         }
     }
@@ -1158,11 +1404,11 @@ int main(int argc, char** argv) {
     }
 
     // ── Restore everything on exit ──
-    if (have_core)   write_int(CORE_DIR + "/constraint_0_power_limit_uw", 0);
-    if (have_uncore) write_int(UNCORE_DIR + "/constraint_0_power_limit_uw", 0);
-    if (!POWERCLAMP_DEV.empty()) write_int(POWERCLAMP_DEV + "/cur_state", g_saved_powerclamp_state);
-    restore_online_state();
-    restore_cpu_state();
+    rapl_set_all(s.all_rapl_domains, 0.0);  // reset all subdomains to unlimited
+    if (!s.thermal.powerclamp_dev.empty())
+        write_int(s.thermal.powerclamp_dev + "/cur_state", s.thermal.saved_powerclamp_state);
+    restore_online_state(s.cpu);
+    restore_cpu_state(s);
 
     syslog(LOG_INFO, "stopped");
     closelog();
