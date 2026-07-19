@@ -370,6 +370,36 @@ static unsigned long long read_msr(int cpu, unsigned int msr_addr) {
     return val;
 }
 
+static bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return false;
+    bool ok = false;
+    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
+        ok = (write(fd, &val, sizeof(val)) == sizeof(val));
+    }
+    close(fd);
+    return ok;
+}
+
+// Clear Performance Limit Reasons (MSR 0x6B0) and Package Therm Log (MSR 0x6B1).
+// Writing 0 to both clears current reasons + all sticky/history bits.
+// Useful for resetting so that new throttling blips can be observed from zero.
+static void clear_perf_limit_history() {
+    if (!msr_available()) {
+        std::cout << color(YEL, "   [PLR clear skipped — MSR unavailable]") << std::endl;
+        return;
+    }
+    bool ok0 = write_msr(0, 0x6B0, 0ULL);   // IA32_PERF_LIMIT_LOG (current + sticky)
+    bool ok1 = write_msr(0, 0x6B1, 0ULL);   // IA32_PACKAGE_THERM_LOG (sticky therm events)
+    if (ok0 && ok1) {
+        std::cout << color(GRN, "   ✓ Perf-limit history cleared (MSR 0x6B0, 0x6B1)") << std::endl;
+    } else {
+        std::cout << color(RED, "   ✗ Failed to clear perf-limit history (check permissions)") << std::endl;
+    }
+}
+
 // Intel Perf Limit Reasons bit definitions for MSR 0x690 / 0x6B0
 // Lower 16 bits = current status, upper 16 bits = sticky (LOG)
 struct PerfLimitBits {
@@ -1232,7 +1262,22 @@ static void refresh() {
     std::cout << "\033[?25h";
 }
 
-int main() {
+int main(int argc, char** argv) {
+    bool clear_plr = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--clear-plr") == 0) {
+            clear_plr = true;
+        }
+    }
+
+    // Clear PLR history before entering the monitoring loop.
+    // This resets all sticky/perf-limit bits so new throttling events
+    // (including sub-second blips) are observed from a clean slate.
+    if (clear_plr) {
+        std::cout << "\033[H\033[2J";  // clear screen
+        clear_perf_limit_history();
+    }
+
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
 
