@@ -9,15 +9,17 @@ enable_testing()
 
 find_package(GTest REQUIRED)
 
-add_executable(power-balance src/power-balance.cpp)
+add_executable(power-balance src/power-balance.cpp src/power-optimizer.cpp src/power-utils.cpp)
+target_include_directories(power-balance PRIVATE src)
 target_compile_options(power-balance PRIVATE -Wall -Wextra)
 
-add_executable(power-status src/power-status.cpp)
+add_executable(power-status src/power-status.cpp src/power-utils.cpp)
+target_include_directories(power-status PRIVATE src)
 target_compile_options(power-status PRIVATE -Wall -Wextra)
 
 # ── Unit tests ──
-add_executable(test-power-balance tests/test_power_balance.cpp)
-target_include_directories(test-power-balance PRIVATE tests)
+add_executable(test-power-balance tests/test_power_balance.cpp src/power-optimizer.cpp)
+target_include_directories(test-power-balance PRIVATE src)
 target_link_libraries(test-power-balance GTest::gtest GTest::gtest_main)
 target_compile_options(test-power-balance PRIVATE -Wall -Wextra)
 

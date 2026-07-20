@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <vector>
 #include <functional>
+#include "power-utils.h"
 
 // ── Plain ANSI color codes (3-bit only — universally supported) ──
 // Reset: \033[0m   Red: \033[31m   Green: \033[32m
@@ -37,49 +38,7 @@ static std::string color(const char* fg, const std::string& text) {
     return std::string(fg) + text + RST;
 }
 
-// ── Sysfs helpers ──
 
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f.is_open()) return "";
-    std::string content;
-    std::getline(f, content);
-    content.erase(0, content.find_first_not_of(" \t\n\r"));
-    content.erase(content.find_last_not_of(" \t\n\r") + 1);
-    return content;
-}
-
-template<typename T>
-static bool read_attr(const std::string& dir, const std::string& name, T& out) {
-    std::string val = read_file(dir + "/" + name);
-    if (val.empty()) return false;
-    std::istringstream iss(val);
-    return (bool)(iss >> out);
-}
-
-static int read_uA(const std::string& dir, const std::string& name) {
-    long long v;
-    if (read_attr(dir, name, v)) return (int)(v / 1000);
-    return -1;
-}
-
-static int read_uW(const std::string& dir, const std::string& name) {
-    long long v;
-    if (read_attr(dir, name, v)) return (int)(v / 1000);
-    return -1;
-}
-
-static int read_uV(const std::string& dir, const std::string& name) {
-    long long v;
-    if (read_attr(dir, name, v)) return (int)(v / 1000);
-    return -1;
-}
-
-static int read_temp(const std::string& dir) {
-    int t;
-    if (read_attr(dir, "temp", t)) return t / 10;
-    return -1;
-}
 
 // ── Helpers ──
 
@@ -109,25 +68,7 @@ static const char* temp_color(int celsius) {
     return RED;
 }
 
-struct Battery {
-    std::string name, status, health, model, manufacturer, technology;
-    int capacity = 0;
-    int cycle_count = -1;
-    int charge_now_mA = -1;
-    int charge_full_mA = -1;
-    int charge_full_design_mA = -1;
-    int voltage_now_mV = -1;
-    int current_now_mA = -1;
-    int temp_C = -1;
-};
 
-struct Charger {
-    std::string name;
-    std::string status, online;
-    int voltage_mV = -1;
-    int current_mA = -1;
-    int power_mW = -1;
-};
 
 static std::string current_time_str() {
     auto now = std::chrono::system_clock::now();
@@ -149,107 +90,79 @@ static std::string hex(unsigned long long val, int width) {
 // ── Temperature reading ──
 
 static int read_cpu_pkg_temp() {
+    // Try x86_pkg_temp first (most accurate for CPU package).
+    // Fallback to SOC DTS or CPU thermal zones if x86_pkg_temp is not available.
+    // On Meteor Lake, multiple thermal zones may exist; we take the highest temp.
     DIR* dir = opendir("/sys/class/thermal");
     if (!dir) return -1;
+    int max_temp = -1;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
         if (name[0] == '.') continue;
-        std::string type = read_file("/sys/class/thermal/" + name + "/type");
-        if (type == "x86_pkg_temp") {
+        std::string type = sysfs_read_file("/sys/class/thermal/" + name + "/type");
+        if (type == "x86_pkg_temp" || type == "SOC DTS" || type == "CPU") {
             int t;
-            if (read_attr("/sys/class/thermal/" + name, "temp", t)) {
-                closedir(dir);
-                return safe_celsius(t / 1000);
+            if (sysfs_read_attr("/sys/class/thermal/" + name, "temp", t)) {
+                int celsius = safe_celsius(t / 1000);
+                if (celsius > max_temp) max_temp = celsius;
             }
         }
     }
     closedir(dir);
-    return -1;
+    return max_temp;
 }
 
-static std::string find_coretemp_hwmon() {
-    DIR* dir = opendir("/sys/class/hwmon");
-    if (!dir) return "";
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name[0] == '.') continue;
-        std::string driver = read_file("/sys/class/hwmon/" + name + "/name");
-        if (driver == "coretemp") {
-            closedir(dir);
-            return "/sys/class/hwmon/" + name;
-        }
-    }
-    closedir(dir);
-    return "";
-}
 
-static std::map<std::string, int> read_cpu_core_temps() {
-    std::map<std::string, int> cores;
-    std::string hwmon_dir = find_coretemp_hwmon();
-    if (hwmon_dir.empty()) return cores;
-
-    DIR* subdir = opendir(hwmon_dir.c_str());
-    if (!subdir) return cores;
-    struct dirent* fe;
-    while ((fe = readdir(subdir)) != nullptr) {
-        std::string fname = fe->d_name;
-        if (fname.size() < 11) continue;
-        if (fname.substr(0, 4) != "temp") continue;
-        size_t us = fname.find("_input", 4);
-        if (us == std::string::npos || us < 5) continue;
-
-        std::string full = hwmon_dir + "/" + fname;
-
-        std::string val = read_file(full);
-        if (val.empty()) continue;
-
-        int raw = 0;
-        if (!(std::istringstream(val) >> raw)) continue;
-        int celsius = raw / 1000;
-
-        std::string num_part = fname.substr(4, us - 4);
-        std::string label_path = hwmon_dir + "/temp" + num_part + "_label";
-            std::string label = read_file(label_path);
-            if (label.empty()) continue;
-            // Skip the package-level temp entry (e.g. "Package id 0")
-            if (label.find("Package") != std::string::npos) continue;
-            cores[label] = celsius;
-    }
-    closedir(subdir);
-    return cores;
-}
 
 static int read_gpu_temp() {
-    DIR* drm_dir = opendir("/sys/class/drm");
-    if (!drm_dir) return -1;
-    struct dirent* entry;
-    while ((entry = readdir(drm_dir)) != nullptr) {
-        std::string card = entry->d_name;
-        if (card.find("card") != 0) continue;
-        std::string hwmon_base = "/sys/class/drm/" + card + "/device/hwmon";
-        DIR* hdir = opendir(hwmon_base.c_str());
-        if (!hdir) continue;
-        struct dirent* hentry;
-        while ((hentry = readdir(hdir)) != nullptr) {
-            std::string hwmon = hentry->d_name;
-            if (hwmon[0] == '.') continue;
-            std::string hname = read_file(hwmon_base + "/" + hwmon + "/name");
-            if (hname.find("i915") != std::string::npos ||
-                hname.find("amdgpu") != std::string::npos) {
-                int t;
-                if (read_attr(hwmon_base + "/" + hwmon, "temp1_input", t)) {
-                    closedir(drm_dir);
-                    closedir(hdir);
-                    return safe_celsius(t / 1000);
+    // Try hwmon first — works for i915, amdgpu, and Xe dGPU.
+    // Xe dGPU hwmon is named "xe" but is only available for discrete GPUs (IS_DGFX).
+    // On integrated GPUs (Meteor Lake iGPU), there is no GPU-specific hwmon.
+    {
+        DIR* hwmon_dir = opendir("/sys/class/hwmon");
+        if (hwmon_dir) {
+            struct dirent* entry;
+            while ((entry = readdir(hwmon_dir)) != nullptr) {
+                std::string name = entry->d_name;
+                if (name[0] == '.') continue;
+                std::string hname = sysfs_read_file("/sys/class/hwmon/" + name + "/name");
+                if (hname.find("i915") != std::string::npos ||
+                    hname.find("amdgpu") != std::string::npos ||
+                    hname.find("xe") != std::string::npos) {
+                    int t;
+                    if (sysfs_read_attr("/sys/class/hwmon/" + name, "temp1_input", t)) {
+                        closedir(hwmon_dir);
+                        return safe_celsius(t / 1000);
+                    }
                 }
             }
+            closedir(hwmon_dir);
         }
-        closedir(hdir);
     }
-    closedir(drm_dir);
-    return -1;
+
+    // Fallback: scan thermal zones for GPU-related sensors.
+    // On Meteor Lake iGPU, there is no dedicated GPU thermal zone.
+    // x86_pkg_temp gives package temp (CPU+GPU), which is the closest thing.
+    // SOC DTS / CPU zones may also be relevant.
+    DIR* thermal_dir = opendir("/sys/class/thermal");
+    if (!thermal_dir) return -1;
+    int pkg_temp = -1;
+    struct dirent* entry;
+    while ((entry = readdir(thermal_dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name[0] == '.') continue;
+        std::string type = sysfs_read_file("/sys/class/thermal/" + name + "/type");
+        if (type == "x86_pkg_temp" || type == "SOC DTS" || type == "CPU") {
+            int t;
+            if (sysfs_read_attr("/sys/class/thermal/" + name, "temp", t)) {
+                int celsius = safe_celsius(t / 1000);
+                if (celsius > pkg_temp) pkg_temp = celsius;
+            }
+        }
+    }
+    closedir(thermal_dir);
+    return pkg_temp;
 }
 
 static int read_nvme_temp() {
@@ -259,10 +172,10 @@ static int read_nvme_temp() {
     while ((entry = readdir(dir)) != nullptr) {
         std::string hwmon = entry->d_name;
         if (hwmon[0] == '.') continue;
-        std::string name = read_file("/sys/class/hwmon/" + hwmon + "/name");
+        std::string name = sysfs_read_file("/sys/class/hwmon/" + hwmon + "/name");
         if (name.find("nvme") != std::string::npos) {
             int t;
-            if (read_attr("/sys/class/hwmon/" + hwmon, "temp1_input", t)) {
+            if (sysfs_read_attr("/sys/class/hwmon/" + hwmon, "temp1_input", t)) {
                 closedir(dir);
                 return safe_celsius(t / 1000);
             }
@@ -272,46 +185,7 @@ static int read_nvme_temp() {
     return -1;
 }
 
-// ── Discover power supplies ──
 
-static std::vector<std::pair<std::string, std::string>> list_power_supplies() {
-    std::vector<std::pair<std::string, std::string>> supplies;
-    DIR* dir = opendir("/sys/class/power_supply");
-    if (!dir) return supplies;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name[0] == '.') continue;
-        std::string type = read_file("/sys/class/power_supply/" + name + "/type");
-        supplies.push_back({name, type});
-    }
-    closedir(dir);
-    std::sort(supplies.begin(), supplies.end());
-    return supplies;
-}
-
-// ── Format remaining time ──
-
-static std::string format_remaining(int capacity_pct, int charge_now, int current_mA) {
-    if (current_mA <= 0 || charge_now <= 0) return "calculating...";
-    double hours = (double)capacity_pct * charge_now / (100.0 * current_mA);
-    if (hours < 0.05) return "< 3 min";
-    if (hours > 99.9) return "> 99h";
-    int h = (int)hours;
-    int m = (int)((hours - h) * 60 + 0.5);
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%dh %02dm", h, m);
-    return std::string(buf);
-}
-
-// ── Status color mapping ──
-
-static const char* status_color(const std::string& status) {
-    if (status == "Charging" || status == "Full") return GRN;
-    if (status == "Discharging") return RED;
-    if (status.find("Pending") != std::string::npos) return YEL;
-    return WHT;
-}
 
 // ── Global for signal handler ──
 static volatile sig_atomic_t g_running = 1;
@@ -319,68 +193,27 @@ static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int) { g_running = 0; }
 
 // ── GPU throttle event tracking (Xe driver reason_* files) ──
-
-static const char* XE_THROTTLE_REASONS[] = {
-    "pl1", "pl2", "pl4", "prochot", "thermal", "ratl", "vr_tdc", "vr_thermalert", nullptr
-};
-static const char* XE_THROTTLE_FILES[] = {
-    "reason_pl1", "reason_pl2", "reason_pl4",
-    "reason_prochot", "reason_thermal", "reason_ratl",
-    "reason_vr_tdc", "reason_vr_thermalert", nullptr
-};
+// Uses shared XE_THROTTLE_REASONS/XE_THROTTLE_FILES from power-utils.h
 
 struct GpuThrottleState {
     int events[8] = {0};
     int total_events = 0;
     bool prev_active[8] = {false};
+    bool cur_active[8] = {false};   // current read state (0/1 from sysfs)
 };
 
 static void track_gpu_throttle(GpuThrottleState& state, const std::string& throttle_dir) {
     for (int i = 0; XE_THROTTLE_FILES[i]; ++i) {
         int v = 0;
-        read_attr(throttle_dir, XE_THROTTLE_FILES[i], v);
+        sysfs_read_attr(throttle_dir, XE_THROTTLE_FILES[i], v);
         bool active = (v != 0);
         if (active && !state.prev_active[i]) {
             state.events[i]++;
             state.total_events++;
         }
         state.prev_active[i] = active;
+        state.cur_active[i] = active;
     }
-}
-
-// ── MSR reading (Perf Limit Reasons) ──
-
-static bool msr_available() {
-    int fd = open("/dev/cpu/0/msr", O_RDONLY);
-    if (fd < 0) return false;
-    close(fd);
-    return true;
-}
-
-static unsigned long long read_msr(int cpu, unsigned int msr_addr) {
-    char path[64];
-    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    unsigned long long val = 0;
-    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
-        if (read(fd, &val, sizeof(val)) != sizeof(val)) val = 0;
-    }
-    close(fd);
-    return val;
-}
-
-static bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val) {
-    char path[64];
-    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) return false;
-    bool ok = false;
-    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
-        ok = (write(fd, &val, sizeof(val)) == sizeof(val));
-    }
-    close(fd);
-    return ok;
 }
 
 // Clear Performance Limit Reasons (MSR 0x6B0) and Package Therm Log (MSR 0x6B1).
@@ -402,29 +235,7 @@ static void clear_perf_limit_history() {
 
 // Intel Perf Limit Reasons bit definitions for MSR 0x690 / 0x6B0
 // Lower 16 bits = current status, upper 16 bits = sticky (LOG)
-struct PerfLimitBits {
-    const char* name;
-    unsigned int bit;
-};
-
-static const PerfLimitBits PERF_LIMIT_REASONS[] = {
-    {"PROCHOT",         0},
-    {"Thermal",         1},
-    {"Current (EDP)",   2},
-    {"Power (PL1)",     3},
-    {"Platform",        4},
-    {"Autonomous",      5},
-    {"VR Thermal",      6},
-    {"HTC",             7},
-    {"Core/Cache",      8},
-    {"Amps",            9},
-    {"PROCHOT Deassert",10},
-    {"PL4/Peak",       11},
-    {"PkgPwr Latch",   12},
-    {"Clipping",       13},
-    {"", 0}  // sentinel
-};
-
+// Using shared PERF_LIMIT_REASONS_BITS from power-utils.h
 // Perf limit event tracking (accumulated across refresh cycles)
 struct PerfEventStats {
     int count = 0;
@@ -434,6 +245,46 @@ struct PerfEventStats {
 static PerfEventStats g_pl_stats[16]; // indexed by bit number (0-15)
 static unsigned int g_prev_pkg_current = 0;
 static auto g_start_time = std::chrono::steady_clock::now();
+
+// GPU throttle state (shared between perf-limit table and GPU display)
+static GpuThrottleState g_gpu_throttle;
+static bool g_gpu_init = false;
+static std::string g_xe_freq_base;
+static std::string g_gpu_throttle_dir;
+
+// Discover Xe GPU throttle path and read current state (called once on first refresh).
+// Populates g_gpu_throttle, g_xe_freq_base, g_gpu_throttle_dir.
+static void init_gpu_throttle() {
+    if (g_gpu_init) {
+        if (!g_gpu_throttle_dir.empty())
+            track_gpu_throttle(g_gpu_throttle, g_gpu_throttle_dir);
+        return;
+    }
+    DIR* drm_dir = opendir("/sys/class/drm");
+    if (!drm_dir) return;
+    struct dirent* de;
+    while ((de = readdir(drm_dir)) != nullptr) {
+        std::string card = de->d_name;
+        if (card.find("card") != 0) continue;
+        std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
+        if (sysfs_read_file(candidate + "/cur_freq") != "") {
+            g_xe_freq_base = candidate;
+            g_gpu_throttle_dir = candidate + "/throttle";
+            // First read: snapshot baseline state only (no event counting).
+            // GPU throttle bits can be sticky — a stale bit from a past event
+            // must not be counted as a new event.
+            for (int i = 0; XE_THROTTLE_FILES[i]; ++i) {
+                int v = 0;
+                sysfs_read_attr(g_gpu_throttle_dir, XE_THROTTLE_FILES[i], v);
+                g_gpu_throttle.cur_active[i] = (v != 0);
+                g_gpu_throttle.prev_active[i] = g_gpu_throttle.cur_active[i];
+            }
+            g_gpu_init = true;
+            break;
+        }
+    }
+    closedir(drm_dir);
+}
 
 // ── Thermal throttle sysfs reader ──
 
@@ -449,75 +300,16 @@ struct ThrottleStats {
 static ThrottleStats read_throttle_stats(int cpu) {
     ThrottleStats s;
     std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/thermal_throttle";
-    read_attr(dir, "core_throttle_count", s.core_count);
-    read_attr(dir, "core_throttle_max_time_ms", s.core_max_ms);
-    read_attr(dir, "core_throttle_total_time_ms", s.core_total_ms);
-    read_attr(dir, "package_throttle_count", s.pkg_count);
-    read_attr(dir, "package_throttle_max_time_ms", s.pkg_max_ms);
-    read_attr(dir, "package_throttle_total_time_ms", s.pkg_total_ms);
+    sysfs_read_attr(dir, "core_throttle_count", s.core_count);
+    sysfs_read_attr(dir, "core_throttle_max_time_ms", s.core_max_ms);
+    sysfs_read_attr(dir, "core_throttle_total_time_ms", s.core_total_ms);
+    sysfs_read_attr(dir, "package_throttle_count", s.pkg_count);
+    sysfs_read_attr(dir, "package_throttle_max_time_ms", s.pkg_max_ms);
+    sysfs_read_attr(dir, "package_throttle_total_time_ms", s.pkg_total_ms);
     return s;
 }
 
 // ── RAPL powercap reader ──
-
-struct RAPLDomain {
-    std::string name;
-    std::string base_path;
-    long long power_uw = -1;
-    long long energy_uj = -1;
-    long long pl1_uw = -1;
-    long long pl1_window_us = -1;
-    long long pl1_max_uw = -1;
-    long long pl2_uw = -1;
-    long long pl2_window_us = -1;
-    long long pl4_uw = -1;
-};
-
-static void scan_rapl_domains_in(const std::string& dir_path, std::vector<RAPLDomain>& domains) {
-    DIR* dir = opendir(dir_path.c_str());
-    if (!dir) return;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name[0] == '.') continue;
-
-        // Only recurse into actual RAPL domain directories (have ":" in name)
-        // This avoids following symlinks like "device" or "subsystem"
-        if (name.find(':') == std::string::npos) continue;
-
-        std::string full = dir_path + "/" + name;
-
-        std::string rname = read_file(full + "/name");
-        if (rname.empty()) continue;
-
-        RAPLDomain d;
-        d.name = rname;
-        d.base_path = full;
-        long long tmp;
-        if (read_attr(full, "power_uw", tmp)) d.power_uw = tmp;
-        if (read_attr(full, "energy_uj", tmp)) d.energy_uj = tmp;
-
-        if (read_attr(full, "constraint_0_power_limit_uw", tmp)) d.pl1_uw = tmp;
-        if (read_attr(full, "constraint_0_time_window_us", tmp)) d.pl1_window_us = tmp;
-        if (read_attr(full, "constraint_0_max_power_uw", tmp)) d.pl1_max_uw = tmp;
-        if (read_attr(full, "constraint_1_power_limit_uw", tmp)) d.pl2_uw = tmp;
-        if (read_attr(full, "constraint_1_time_window_us", tmp)) d.pl2_window_us = tmp;
-        if (read_attr(full, "constraint_2_power_limit_uw", tmp)) d.pl4_uw = tmp;
-
-        domains.push_back(d);
-
-        // Recurse into subdomains (entries with two ":" separators, e.g., intel-rapl:0:0)
-        scan_rapl_domains_in(full, domains);
-    }
-    closedir(dir);
-}
-
-static std::vector<RAPLDomain> read_rapl_domains() {
-    std::vector<RAPLDomain> domains;
-    scan_rapl_domains_in("/sys/class/powercap/intel-rapl", domains);
-    scan_rapl_domains_in("/sys/class/powercap/intel-rapl-mmio", domains);
-    return domains;
-}
 
 // ── Format power values ──
 
@@ -542,6 +334,107 @@ static std::string fmt_time_us(long long us) {
     return std::to_string(us) + " us";
 }
 
+// ── ANSI visual-width helper ──
+// Counts visible characters, stripping \033[...m escape sequences.
+static size_t ansi_visual_len(const std::string& s) {
+    size_t v = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\033' && i + 1 < s.size() && s[i + 1] == '[') {
+            size_t j = i + 2;
+            while (j < s.size() && s[j] != 'm') ++j;
+            i = j; // advance past the closing 'm'
+        } else {
+            ++v;
+        }
+    }
+    return v;
+}
+
+// ── Box-drawn table helper ──
+// Usage:
+//   Table t({"header1", "h2"});
+//   t.row({"cell1", "val"});
+//   t.print();
+struct Table {
+    std::vector<std::string> headers;
+    std::vector<std::vector<std::string>> rows;
+    std::vector<size_t> widths;
+    std::string indent;
+
+    Table() = default;
+    Table(const std::vector<std::string>& hdr, const std::string& ind = "   ")
+        : headers(hdr), indent(ind) {
+        for (auto& h : headers) widths.push_back(h.size());
+    }
+    void row(const std::vector<std::string>& cells) {
+        rows.push_back(cells);
+        for (size_t i = 0; i < (std::min)(cells.size(), headers.size()); ++i) {
+            size_t vw = ansi_visual_len(cells[i]);
+            if (vw > widths[i]) widths[i] = vw;
+        }
+    }
+    void print() const {
+        auto pad = [](const std::string& s, size_t w) {
+            size_t vw = ansi_visual_len(s);
+            return s + std::string(std::max(w, vw) - vw, ' ');
+        };
+
+        // but we need different corner chars for top/mid/bottom
+        // Box-drawing chars are multi-byte UTF-8 — use string repeat helper.
+        auto repeat = [](const std::string& s, size_t n) {
+            std::string r;
+            r.reserve(s.size() * n);
+            for (size_t i = 0; i < n; ++i) r += s;
+            return r;
+        };
+        auto top_sep = [this,&repeat]() -> std::string {
+            std::string line = indent + "┌";
+            for (size_t i = 0; i < headers.size(); ++i) {
+                if (i < headers.size() - 1)
+                    line += repeat("─", widths[i] + 1) + "┬";
+                else
+                    line += repeat("─", widths[i] + 1) + "┐";
+            }
+            return line;
+        };
+        auto mid_sep = [this,&repeat]() -> std::string {
+            std::string line = indent + "├";
+            for (size_t i = 0; i < headers.size(); ++i) {
+                if (i < headers.size() - 1)
+                    line += repeat("─", widths[i] + 1) + "┼";
+                else
+                    line += repeat("─", widths[i] + 1) + "┤";
+            }
+            return line;
+        };
+        auto bot_sep = [this,&repeat]() -> std::string {
+            std::string line = indent + "└";
+            for (size_t i = 0; i < headers.size(); ++i) {
+                if (i < headers.size() - 1)
+                    line += repeat("─", widths[i] + 1) + "┴";
+                else
+                    line += repeat("─", widths[i] + 1) + "┘";
+            }
+            return line;
+        };
+        auto print_row = [this,&pad](const std::vector<std::string>& cells) {
+            std::string line = indent + "│";
+            for (size_t i = 0; i < headers.size(); ++i) {
+                line += " " + pad(i < cells.size() ? cells[i] : "", widths[i]) + "│";
+            }
+            std::cout << line << std::endl;
+        };
+
+        std::cout << top_sep() << std::endl;
+        print_row(headers);
+        if (!rows.empty()) {
+            std::cout << mid_sep() << std::endl;
+            for (auto& r : rows) print_row(r);
+        }
+        std::cout << bot_sep() << std::endl;
+    }
+};
+
 // ── Live power from RAPL energy counter deltas ──
 
 struct RAPLState {
@@ -564,130 +457,39 @@ static void refresh() {
     std::cout << color(CYN, "══════════════════════════════════════════════════════════") << std::endl;
     std::cout << std::endl;
 
-    auto supplies = list_power_supplies();
-    Battery battery;
-    Charger charger;
-    bool has_battery = false;
-    bool has_charger = false;
-
-    for (auto& [name, type] : supplies) {
-        std::string path = "/sys/class/power_supply/" + name;
-
-        if (type == "Battery") {
-            if (!has_battery) {
-                has_battery = true;
-                battery.name = name;
-                read_attr(path, "status", battery.status);
-                read_attr(path, "health", battery.health);
-                read_attr(path, "model_name", battery.model);
-                read_attr(path, "manufacturer", battery.manufacturer);
-                read_attr(path, "technology", battery.technology);
-                read_attr(path, "capacity", battery.capacity);
-                read_attr(path, "cycle_count", battery.cycle_count);
-                battery.charge_now_mA = read_uA(path, "charge_now");
-                battery.charge_full_mA = read_uA(path, "charge_full");
-                battery.charge_full_design_mA = read_uA(path, "charge_full_design");
-                battery.voltage_now_mV = read_uV(path, "voltage_now");
-                battery.current_now_mA = read_uA(path, "current_now");
-                battery.temp_C = read_temp(path);
+    // ── Power supply (charger only — battery info removed) ──
+    {
+        DIR* ps = opendir("/sys/class/power_supply");
+        std::string charger_name, charger_power_mw;
+        bool on_ac = false;
+        if (ps) {
+            struct dirent* entry;
+            while ((entry = readdir(ps)) != nullptr) {
+                std::string name = entry->d_name;
+                if (name[0] == '.') continue;
+                std::string type = sysfs_read_file("/sys/class/power_supply/" + name + "/type");
+                if (type == "Mains") {
+                    std::string online = sysfs_read_file("/sys/class/power_supply/" + name + "/online");
+                    if (online == "1") {
+                        on_ac = true;
+                        charger_name = name;
+                        long long pwr = 0;
+                        sysfs_read_attr("/sys/class/power_supply/" + name, "power_now", pwr);
+                        if (pwr > 0) charger_power_mw = std::to_string(pwr / 1000) + " W";
+                    }
+                } else if (type == "Battery") {
+                    std::string status = sysfs_read_file("/sys/class/power_supply/" + name + "/status");
+                    if (status == "Discharging") on_ac = false;
+                }
             }
-        } else {
-            if (!has_charger) {
-                has_charger = true;
-                charger.name = name;
-                read_attr(path, "status", charger.status);
-                read_attr(path, "online", charger.online);
-                charger.voltage_mV = read_uV(path, "voltage_now");
-                charger.current_mA = read_uA(path, "current_now");
-                charger.power_mW = read_uW(path, "power_now");
-            }
+            closedir(ps);
         }
+        std::cout << "   AC:       " << color(on_ac ? GRN : RED, on_ac ? "connected" : "disconnected");
+        if (!charger_power_mw.empty())
+            std::cout << "  " << color(WHT, charger_power_mw);
+        std::cout << std::endl;
+        std::cout << std::endl;
     }
-
-    // ── Battery display ──
-    if (has_battery) {
-        std::cout << color(YEL, "🔋 Battery") << std::endl;
-
-        std::string status_warn;
-        std::string time_remaining;
-        bool warning = (battery.status == "Discharging");
-
-        if (warning) {
-            time_remaining = format_remaining(
-                battery.capacity,
-                battery.charge_now_mA,
-                battery.current_now_mA
-            );
-            status_warn = " ⚠ DISCHARGING — " + color(RED, "~" + time_remaining + " remaining");
-        }
-
-        std::cout << "   Status:  " << color(status_color(battery.status), battery.status)
-                  << status_warn << std::endl;
-        std::cout << "   Level:   " << color(WHT, std::to_string(battery.capacity) + "%") << std::endl;
-        if (!battery.health.empty())
-            std::cout << "   Health:  " << color(WHT, battery.health) << std::endl;
-        if (battery.cycle_count >= 0)
-            std::cout << "   Cycle:   " << color(WHT, std::to_string(battery.cycle_count)) << std::endl;
-        if (battery.temp_C >= 0)
-            std::cout << "   Temp:    " << color(WHT, std::to_string(battery.temp_C) + "°C") << std::endl;
-
-        std::string charge_str;
-        if (battery.charge_now_mA >= 0 && battery.charge_full_mA >= 0) {
-            charge_str = std::to_string(battery.charge_now_mA) + " mAh / "
-                       + std::to_string(battery.charge_full_mA) + " mAh";
-            if (battery.charge_full_design_mA > 0) {
-                charge_str += " (" + std::to_string(battery.charge_full_design_mA) + " mAh design)";
-            }
-        } else {
-            charge_str = "?";
-        }
-        std::cout << "   Charge:  " << color(WHT, charge_str) << std::endl;
-
-        std::string volt_str = battery.voltage_now_mV >= 0
-            ? std::to_string(battery.voltage_now_mV) + " mV" : "?";
-        std::cout << "   Voltage: " << color(WHT, volt_str) << std::endl;
-
-        if (battery.current_now_mA >= 0) {
-            std::cout << "   Current: " << color(WHT, std::to_string(battery.current_now_mA) + " mA") << std::endl;
-        }
-
-        if (!battery.manufacturer.empty() || !battery.model.empty()) {
-            std::string model_str = battery.manufacturer;
-            if (!battery.model.empty()) model_str += " " + battery.model;
-            std::cout << "   Model:   " << color(MAG, model_str) << std::endl;
-        }
-
-        if (!battery.technology.empty()) {
-            std::cout << "   Tech:    " << color(MAG, battery.technology) << std::endl;
-        }
-    } else {
-        std::cout << color(WHT, "No battery detected") << std::endl;
-    }
-
-    std::cout << std::endl;
-
-    // ── Charger display ──
-    if (has_charger) {
-        std::cout << color(YEL, "🔌 Charger") << " (" + charger.name + ")" << std::endl;
-
-        std::string charger_status_str;
-        if (!charger.status.empty()) charger_status_str = charger.status;
-        else if (!charger.online.empty()) charger_status_str = (charger.online == "1") ? "Online" : "Offline";
-        else charger_status_str = "?";
-
-        std::cout << "   Status: " << color(status_color(charger_status_str), charger_status_str) << std::endl;
-
-        if (charger.voltage_mV >= 0)
-            std::cout << "   Voltage: " << color(WHT, std::to_string(charger.voltage_mV) + " mV") << std::endl;
-        if (charger.current_mA >= 0)
-            std::cout << "   Current: " << color(WHT, std::to_string(charger.current_mA) + " mA") << std::endl;
-        if (charger.power_mW >= 0)
-            std::cout << "   Power:   " << color(WHT, std::to_string(charger.power_mW) + " mW") << std::endl;
-    } else {
-        std::cout << color(WHT, "No external charger detected") << std::endl;
-    }
-
-    std::cout << std::endl;
 
     // ── Temperature display ──
     std::cout << color(YEL, "🌡️ Temperatures") << std::endl;
@@ -699,20 +501,11 @@ static void refresh() {
         std::cout << "   CPU pkg: " << color(BLK, "N/A") << std::endl;
     }
 
-    auto cores = read_cpu_core_temps();
-    if (!cores.empty()) {
-        std::cout << "   Cores:";
-        for (auto& [label, t] : cores) {
-            std::cout << " " << color(temp_color(t), label + ": " + std::to_string(t) + "°C");
-        }
-        std::cout << std::endl;
-    }
-
     int gpu = read_gpu_temp();
     if (gpu >= 0) {
         std::cout << "   GPU:     " << color(temp_color(gpu), std::to_string(gpu) + "°C") << std::endl;
     } else {
-        std::cout << "   GPU:     " << color(BLK, "N/A (no sensor exposed)") << std::endl;
+        std::cout << "   GPU:     " << color(BLK, "N/A (iGPU: no dedicated temp sensor; see CPU pkg)") << std::endl;
     }
 
     int nvme = read_nvme_temp();
@@ -734,13 +527,11 @@ static void refresh() {
     // ── Performance Limits & Throttling Report ──
     std::cout << color(YEL, "⚙️  Performance Limits & Throttling") << std::endl;
 
-    // 1. MSR-based Perf Limit Reasons (needs root for /dev/cpu/N/msr)
-    bool msr_ok = msr_available();
-
+    // ── Helper: format a bitmask as comma-separated reason names ──
     auto fmt_bits = [](unsigned int bits) -> std::string {
         std::string r;
         unsigned int remaining = bits;
-        for (int i = 0; PERF_LIMIT_REASONS[i].name[0]; ++i) {
+        for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i) {
             unsigned int m = 1u << PERF_LIMIT_REASONS[i].bit;
             if (bits & m) {
                 if (!r.empty()) r += ", ";
@@ -759,147 +550,138 @@ static void refresh() {
         return r;
     };
 
+    // ── Perf Limit Reasons table ──
+    bool msr_ok = msr_available();
+    unsigned long long pkg_reasons = 0, pkg_sticky = 0;
+    unsigned int pkg_current = 0, pkg_logged = 0;
     if (msr_ok) {
-        // Package perf limit reasons (MSR 0x6B0) - current + logged in one MSR
-        unsigned long long pkg_reasons = read_msr(0, 0x6B0);
-        unsigned int pkg_current = pkg_reasons & 0xFFFF;
-        unsigned int pkg_logged  = (pkg_reasons >> 16) & 0xFFFF;
+        pkg_reasons = read_msr(0, 0x6B0);
+        pkg_current = pkg_reasons & 0xFFFF;
+        pkg_logged  = (pkg_reasons >> 16) & 0xFFFF;
+        pkg_sticky  = read_msr(0, 0x6B1);
 
-        // Also read LOG-only sticky MSR (0x6B1) - shows different history
-        unsigned long long pkg_sticky = read_msr(0, 0x6B1);
-
-        // Update accumulated perf limit event stats
-        unsigned int interval_ms = 5000;
+        // Update accumulated stats
         unsigned int newly_active = pkg_current & ~g_prev_pkg_current;
         for (int b = 0; b < 16; ++b) {
             unsigned int m = 1u << b;
             if (newly_active & m) g_pl_stats[b].count++;
             g_pl_stats[b].active = (pkg_current & m) != 0;
-            if (pkg_current & m) g_pl_stats[b].total_ms += interval_ms;
+            if (pkg_current & m) g_pl_stats[b].total_ms += 5000;
         }
         g_prev_pkg_current = pkg_current;
+    }
 
-        std::cout << "   Package:" << std::endl;
-        std::cout << "     raw 0x6B0: " << color(WHT, hex(pkg_reasons, 16)) << std::endl;
-        std::cout << "     raw 0x6B1: " << color(WHT, hex(pkg_sticky, 16)) << std::endl;
-        {
-            bool active_shown = false;
-            if (pkg_current) {
-                std::string a = fmt_bits(pkg_current);
-                if (!a.empty()) { std::cout << "     active:    " << color(RED, a) << std::endl; active_shown = true; }
-            }
-            if (pkg_logged) {
-                std::string h = fmt_bits(pkg_logged);
-                if (!h.empty()) { std::cout << "     history:   " << color(YEL, h) << std::endl; active_shown = true; }
-            }
-            if (pkg_sticky) {
-                unsigned int sl = (pkg_sticky >> 16) & 0xFFFF;
-                if (sl) {
-                    std::string s = fmt_bits(sl);
-                    if (!s.empty()) { std::cout << "     sticky:    " << color(YEL, s) << std::endl; active_shown = true; }
-                }
-            }
-            if (!active_shown) std::cout << "     " << color(GRN, "no throttling") << std::endl;
-        }
-
-        // Check each core for active throttling
-        bool any_core = false;
+    // Read per-core MSR 0x690
+    struct CorePlr {
+        unsigned int cur = 0, log = 0;
+    };
+    std::vector<CorePlr> core_plrs(cpu_count);
+    if (msr_ok) {
         for (int c = 0; c < cpu_count; ++c) {
             unsigned long long cv = read_msr(c, 0x690);
-            if (cv) {
-                if (!any_core) {
-                    std::cout << "   Cores:" << std::endl;
-                    any_core = true;
-                }
-                unsigned int cur = cv & 0xFFFF;
-                unsigned int log = (cv >> 16) & 0xFFFF;
-                std::string a = fmt_bits(cur);
-                std::string h = fmt_bits(log);
-                std::cout << "     CPU" << c << ": " << color(WHT, hex(cv, 16));
-                if (!a.empty()) std::cout << " active=" << color(RED, a);
-                if (!h.empty()) std::cout << " hist=" << color(YEL, h);
-                std::cout << std::endl;
-            }
+            core_plrs[c].cur = cv & 0xFFFF;
+            core_plrs[c].log = (cv >> 16) & 0xFFFF;
         }
-        if (!any_core) {
-            std::cout << "   Cores:      " << color(GRN, "no active throttling") << std::endl;
-        }
-    } else {
-        std::cout << "   MSR:        " << color(YEL, "unavailable") << " (run with sudo for Perf Limit Reasons)" << std::endl;
     }
 
-    // 2. Thermal throttle stats from sysfs
+    // Read GPU throttle state early so it's available for the perf-limit table
+    init_gpu_throttle();
+
     {
-        // Aggregate across cores for a summary
-        int total_core_count = 0;
-        int max_core_max = 0;
-        int total_core_time = 0;
-        int max_pkg_max = 0;
-        int max_pkg_total = 0;
-        bool any_data = false;
+        auto dot = [](bool on) { return on ? color(RED, "x") : " "; };
+        Table t({"bit", "reason", "pkg cur", "pkg log", "pkg stk", "cores"});
+        for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i) {
+            unsigned int bit = PERF_LIMIT_REASONS[i].bit;
+            unsigned int m = 1u << bit;
+            bool in_pkg_cur = (pkg_current & m) != 0;
+            bool in_pkg_log = (pkg_logged & m) != 0;
+            bool in_pkg_stk = (msr_ok && ((pkg_sticky >> 16) & 0xFFFF) & m) != 0;
 
-        for (int c = 0; c < cpu_count; ++c) {
-            auto t = read_throttle_stats(c);
-            if (t.core_count >= 0) any_data = true;
-            total_core_count += t.core_count;
-            if (t.core_max_ms > max_core_max) max_core_max = t.core_max_ms;
-            total_core_time += t.core_total_ms;
-            if (t.pkg_max_ms > max_pkg_max) max_pkg_max = t.pkg_max_ms;
-            if (t.pkg_total_ms > max_pkg_total) max_pkg_total = t.pkg_total_ms;
-        }
-
-        if (any_data) {
-            std::cout << "   Throttle events:" << std::endl;
+            std::string core_str;
             for (int c = 0; c < cpu_count; ++c) {
-                auto t = read_throttle_stats(c);
-                if (t.core_count > 0 || t.pkg_count > 0) {
-                    std::cout << "     CPU" << c << ": core=" << t.core_count
-                              << " (" << t.core_total_ms << "ms, max " << t.core_max_ms << "ms)"
-                              << "  pkg=" << t.pkg_count
-                              << " (" << t.pkg_total_ms << "ms, max " << t.pkg_max_ms << "ms)" << std::endl;
+                if (core_plrs[c].cur & m) {
+                    if (!core_str.empty()) core_str += ",";
+                    core_str += std::to_string(c);
                 }
             }
-        } else {
-            std::cout << "   Throttle:   " << color(BLK, "N/A") << std::endl;
+            if (core_str.empty()) {
+                for (int c = 0; c < cpu_count; ++c) {
+                    if (core_plrs[c].log & m) {
+                        if (!core_str.empty()) core_str += ",";
+                        core_str += std::to_string(c);
+                    }
+                }
+            }
+            t.row({std::to_string(bit), PERF_LIMIT_REASONS[i].name,
+                   dot(in_pkg_cur), dot(in_pkg_log), dot(in_pkg_stk), core_str});
+        }
+        t.print();
+    }
+    if (!msr_ok) {
+        std::cout << color(YEL, "   ⚠ MSR unavailable — run with sudo for Perf Limit Reasons") << std::endl;
+    }
+
+    // ── GPU Perf Limit Reasons ──
+    {
+        auto dot = [](bool on) { return on ? color(RED, "x") : " "; };
+        Table t({"reason", "active", "events"});
+        for (int i = 0; XE_THROTTLE_REASONS[i]; ++i) {
+            t.row({XE_THROTTLE_REASONS[i],
+                   dot(g_gpu_throttle.cur_active[i]),
+                   std::to_string(g_gpu_throttle.events[i])});
+        }
+        if (g_gpu_init) {
+            std::cout << "   GPU Perf Limits (Xe):" << std::endl;
+            t.print();
         }
     }
 
-    // 2b. Accumulated perf limit event stats (since tool start)
+    std::cout << std::endl;
+
+    // ── Thermal throttle stats ──
+    {
+        bool any_data = false;
+        Table t({"cpu", "core_cnt", "core_ms", "pkg_cnt"});
+        for (int c = 0; c < cpu_count; ++c) {
+            auto s = read_throttle_stats(c);
+            if (s.core_count >= 0) any_data = true;
+            if (s.core_count > 0 || s.pkg_count > 0) {
+                t.row({"cpu" + std::to_string(c),
+                       std::to_string(s.core_count),
+                       std::to_string(s.core_total_ms),
+                       std::to_string(s.pkg_count)});
+            }
+        }
+        if (any_data && !t.rows.empty()) {
+            std::cout << "   Throttle (since boot):" << std::endl;
+            t.print();
+        }
+    }
+
+    // ── Accumulated events since tool start ──
     if (msr_ok) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - g_start_time).count();
-        bool any_events = false;
+        Table t({"reason", "cnt", "total_ms"});
         for (int b = 0; b < 16; ++b) {
-            if (g_pl_stats[b].count > 0 || g_pl_stats[b].total_ms > 0) {
-                any_events = true;
-                break;
+            auto& s = g_pl_stats[b];
+            if (s.count == 0 && s.total_ms == 0) continue;
+            std::string name = "bit" + std::to_string(b);
+            for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i) {
+                if (PERF_LIMIT_REASONS[i].bit == (unsigned)b) { name = PERF_LIMIT_REASONS[i].name; break; }
             }
+            if (s.active) name += color(RED, " x");
+            t.row({name, std::to_string(s.count), std::to_string(s.total_ms)});
         }
-        if (any_events) {
+        if (!t.rows.empty()) {
             std::cout << "   Events (" << elapsed << "s uptime):" << std::endl;
-            for (int b = 0; b < 16; ++b) {
-                auto& s = g_pl_stats[b];
-                if (s.count == 0 && s.total_ms == 0) continue;
-                // Find name for this bit
-                std::string name = "bit" + std::to_string(b);
-                for (int i = 0; PERF_LIMIT_REASONS[i].name[0]; ++i) {
-                    if (PERF_LIMIT_REASONS[i].bit == (unsigned)b) {
-                        name = PERF_LIMIT_REASONS[i].name;
-                        break;
-                    }
-                }
-                std::string active_flag = s.active ? color(RED, " 🔴") : "";
-                std::cout << "     " << name << ":" << active_flag
-                          << "  " << s.count << " event" << (s.count == 1 ? "" : "s")
-                          << "  (" << s.total_ms << "ms)"
-                          << std::endl;
-            }
+            t.print();
         }
     }
 
-    // 3. RAPL power caps + live draw
+    // ── RAPL domains table ──
     {
-        auto domains = read_rapl_domains();
+        auto domains = read_all_rapl_domains();
 
         // Compute live package power from energy_uj delta
         if (!domains.empty()) {
@@ -921,128 +703,141 @@ static void refresh() {
             }
         }
 
-        if (!domains.empty()) {
-            std::cout << "   Power:" << std::endl;
-            bool pkg0_shown = false;
-            for (auto& d : domains) {
-                // Deduplicate package-0 (may appear from both intel-rapl and intel-rapl-mmio)
-                if (d.name == "package-0") {
-                    if (pkg0_shown) continue;
-                    pkg0_shown = true;
-                }
-                std::string line = "     " + d.name;
-                // Determine effective PL1 — max_constraint is the real hw floor
-                long long pl1_effective = d.pl1_uw;
-                bool pl1_clamped = false;
-                if (d.pl1_max_uw > 0 && d.pl1_max_uw < d.pl1_uw) {
-                    pl1_effective = d.pl1_max_uw;
-                    pl1_clamped = true;
-                }
-                // Show live power draw for package-0
-                if (d.name == "package-0" && g_pkg_rapl.live_power_w >= 0) {
-                    const char* pwr_col = GRN;
-                    if (g_pkg_rapl.live_power_w > pl1_effective / 1e6) pwr_col = YEL;
-                    if (g_pkg_rapl.live_power_w > (d.pl4_uw > 0 ? d.pl4_uw / 1e6 : 999)) pwr_col = RED;
-                    line += " draw: " + color(pwr_col, fmt_power_double(g_pkg_rapl.live_power_w));
-                }
-                if (d.pl1_uw > 0) {
-                    line += "  PL1: " + fmt_power(pl1_effective);
-                    if (pl1_clamped) line += color(YEL, " (platform capped)") + " [raw: " + fmt_power(d.pl1_uw) + "]";
-                }
-                if (d.pl1_window_us > 0) line += " window: " + fmt_time_us(d.pl1_window_us);
-                if (d.pl2_uw > 0)   line += "  PL2: " + fmt_power(d.pl2_uw);
-                if (d.pl2_window_us > 0) line += " window: " + fmt_time_us(d.pl2_window_us);
-                if (d.pl4_uw > 0)   line += "  PL4: " + fmt_power(d.pl4_uw);
-                // Check MSR lock status
-                if (msr_ok && d.name == "package-0") {
-                    unsigned long long msr = read_msr(0, 0x610);
-                    if ((msr >> 63) & 1) line += color(RED, " MSR-LOCKED");
-                    if ((msr >> 16) & 1) line += color(YEL, " clamp-on");  // PL1 clamp = throttle below min if limit hit
-                }
-                std::cout << line << std::endl;
+        // Table: domain | draw | PL1 | PL2 | PL4 | lock
+        std::cout << std::endl;
+        Table t({"domain", "draw", "PL1", "PL2", "PL4", "lock"});
+
+        auto val_cell = [](long long uw, long long window_us) -> std::string {
+            if (uw == -1) return std::string(BLK) + "-" + RST;
+            if (uw == 0)  return std::string(YEL) + "inf" + RST;
+            std::string s = fmt_power(uw);
+            if (window_us > 0) s += " (" + fmt_time_us(window_us) + ")";
+            return s;
+        };
+
+        bool pkg0_shown = false;
+        for (auto& d : domains) {
+            if (d.name == "package-0" && pkg0_shown) continue;
+            if (d.name == "package-0") pkg0_shown = true;
+
+            std::string label = d.name;
+            if (d.name == "uncore") label = "uncore (GPU)";
+            else if (d.name == "pp1") label = "pp1 (GPU)";
+
+            long long pl1_eff = d.pl1_uw;
+            bool clamped = false;
+            if (d.pl1_max_uw > 0 && d.pl1_max_uw < d.pl1_uw) {
+                pl1_eff = d.pl1_max_uw;
+                clamped = true;
             }
+
+            std::string draw;
+            if (d.name == "package-0" && g_pkg_rapl.live_power_w >= 0) {
+                const char* col = GRN;
+                if (g_pkg_rapl.live_power_w > pl1_eff / 1e6) col = YEL;
+                if (g_pkg_rapl.live_power_w > (d.pl4_uw > 0 ? d.pl4_uw / 1e6 : 999)) col = RED;
+                draw = color(col, fmt_power_double(g_pkg_rapl.live_power_w));
+            }
+
+            std::string pl1_cell = val_cell(pl1_eff, d.pl1_window_us);
+            if (clamped) pl1_cell += color(YEL, "!");
+
+            std::string lock;
+            if (msr_ok && d.name == "package-0") {
+                unsigned long long msr = read_msr(0, 0x610);
+                if ((msr >> 63) & 1) lock = color(RED, "LOCKED");
+                else if ((msr >> 16) & 1) lock = color(YEL, "clamp-on");
+                else lock = color(GRN, "unlocked");
+            }
+
+            t.row({label, draw, pl1_cell, val_cell(d.pl2_uw, d.pl2_window_us),
+                   val_cell(d.pl4_uw, d.pl4_window_us), lock});
         }
+        t.print();
     }
 
     // ── GPU metrics (Xe driver) ──
-    {
-        // Find any card with a tile0/gt0/freq0 directory (Xe driver)
-        std::string xe_freq_base;
-        DIR* drm_xe = opendir("/sys/class/drm");
-        if (drm_xe) {
-            struct dirent* de;
-            while ((de = readdir(drm_xe)) != nullptr) {
-                std::string card = de->d_name;
-                if (card.find("card") != 0) continue;
-                std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
-                if (read_file(candidate + "/cur_freq") != "") {
-                    xe_freq_base = candidate;
-                    break;
-                }
+    // g_xe_freq_base / g_gpu_throttle already populated by init_gpu_throttle() above.
+    if (!g_xe_freq_base.empty()) {
+        std::string gt_idle = g_xe_freq_base.substr(0, g_xe_freq_base.rfind('/')) + "/gtidle";
+        std::cout << "   GPU:" << std::endl;
+
+        // Throttle status — use 'reasons' file, not 'status'.
+        // The 'status' file reads the raw MSR with mask U32_MAX, so any
+        // garbage/stale bit in the register returns 1, even when the GPU
+        // is idle at 0W. The 'reasons' file masks with
+        // GT0_PERF_LIMIT_REASONS_MASK (0xde3) and returns "none" when clean.
+        // See xe_gt_throttle.c:
+        //   "It's preferred over monitoring status and then reading the
+        //    reason from individual attributes since that is racy."
+        {
+            std::string reasons = sysfs_read_file(g_gpu_throttle_dir + "/reasons");
+            reasons.erase(reasons.find_last_not_of(" \n\r\t") + 1); // trim
+            bool throttling = (!reasons.empty() && reasons != "none");
+
+            std::string throttle_line = "     hw-throttle: ";
+            if (throttling) {
+                throttle_line += color(RED, "active") + " [" + reasons + "]";
+            } else if (g_gpu_throttle.total_events > 0) {
+                throttle_line += color(YEL, "history (" + std::to_string(g_gpu_throttle.total_events) + " events)");
+            } else {
+                throttle_line += color(GRN, "none");
             }
-            closedir(drm_xe);
+            if (g_gpu_throttle.total_events > 0) {
+                throttle_line += "  [";
+                bool first_reason = true;
+                for (int i = 0; XE_THROTTLE_REASONS[i]; ++i) {
+                    if (g_gpu_throttle.events[i] > 0) {
+                        if (!first_reason) throttle_line += " ";
+                        throttle_line += std::string(XE_THROTTLE_REASONS[i]) + ":" + std::to_string(g_gpu_throttle.events[i]);
+                        first_reason = false;
+                    }
+                }
+                throttle_line += "]";
+            }
+            std::cout << throttle_line << std::endl;
         }
 
-        bool has_gpu = !xe_freq_base.empty();
-        if (has_gpu) {
-            std::string gt_idle = xe_freq_base.substr(0, xe_freq_base.rfind('/')) + "/gtidle";
-            std::cout << "   GPU:" << std::endl;
+        // GPU idle state and C0 residency
+        {
+                std::string idle_status = sysfs_read_file(gt_idle + "/idle_status");
+                std::string idle_line = "     idle: ";
+                if (idle_status.find("c6") != std::string::npos)
+                    idle_line += color(GRN, idle_status);
+                else if (idle_status.find("c0") != std::string::npos)
+                    idle_line += color(RED, idle_status);
+                else
+                    idle_line += color(YEL, idle_status);
 
-            // Frequencies
-            int cur, actual, max_f, rp0, rpe, rpn;
-            std::string line = "     freq:";
-            if (read_attr(xe_freq_base, "cur_freq", cur))
-                line += " cur " + std::to_string(cur) + " MHz";
-            if (read_attr(xe_freq_base, "act_freq", actual))
-                line += " act " + std::to_string(actual) + " MHz";
-            if (read_attr(xe_freq_base, "max_freq", max_f))
-                line += " max " + std::to_string(max_f) + " MHz";
-            if (read_attr(xe_freq_base, "rp0_freq", rp0))
-                line += " turbo " + std::to_string(rp0) + " MHz";
-            if (read_attr(xe_freq_base, "rpe_freq", rpe))
-                line += " eff " + std::to_string(rpe) + " MHz";
-            if (read_attr(xe_freq_base, "rpn_freq", rpn))
-                line += " min " + std::to_string(rpn) + " MHz";
-            std::cout << line << std::endl;
-
-            // Throttle status (combined flag + individual reason tracking)
-            {
-                static GpuThrottleState throttle_state;
-                static bool first_throttle = true;
-
-                std::string throttle_dir = xe_freq_base + "/throttle";
-                std::string status = read_file(throttle_dir + "/status");
-                bool throttling = (status == "1");
-
-                if (!first_throttle)
-                    track_gpu_throttle(throttle_state, throttle_dir);
-                first_throttle = false;
-
-                std::string throttle_line = "     hw-throttle: ";
-                if (throttling) {
-                    throttle_line += color(RED, "active");
-                } else if (throttle_state.total_events > 0) {
-                    throttle_line += color(YEL, "history (" + std::to_string(throttle_state.total_events) + " events)");
-                } else {
-                    throttle_line += color(GRN, "none");
-                }
-                if (throttle_state.total_events > 0) {
-                    throttle_line += "  [";
-                    bool first_reason = true;
-                    for (int i = 0; XE_THROTTLE_REASONS[i]; ++i) {
-                        if (throttle_state.events[i] > 0) {
-                            if (!first_reason) throttle_line += " ";
-                            throttle_line += std::string(XE_THROTTLE_REASONS[i]) + ":" + std::to_string(throttle_state.events[i]);
-                            first_reason = false;
+                // C0 residency (activity percentage over last measurement window)
+                // Path: gt0/activity/c0_residency_ms — returns microseconds despite name.
+                {
+                    static long long prev_c0_us = 0;
+                    static std::chrono::steady_clock::time_point prev_c0_time;
+                    std::string c0_path = gt_idle + "/../activity/c0_residency_ms";
+                    std::string c0_str = sysfs_read_file(c0_path);
+                    long long c0_us = 0;
+                    if (!c0_str.empty()) {
+                        try { c0_us = std::stoll(c0_str); } catch (...) { c0_us = 0; }
+                    }
+                    if (c0_us > 0 && prev_c0_us > 0) {
+                        auto now = std::chrono::steady_clock::now();
+                        long long delta_c0 = c0_us - prev_c0_us;
+                        long long delta_time = std::chrono::duration_cast<std::chrono::microseconds>(now - prev_c0_time).count();
+                        if (delta_c0 > 0 && delta_time > 0) {
+                            double c0_pct = std::min(1.0, (double)delta_c0 / (double)delta_time);
+                            idle_line += "  c0=" + color(c0_pct > 0.7 ? RED : c0_pct > 0.3 ? YEL : GRN,
+                                                         std::to_string((int)(c0_pct * 100)) + "%");
                         }
                     }
-                    throttle_line += "]";
+                    prev_c0_us = c0_us;
+                    prev_c0_time = std::chrono::steady_clock::now();
                 }
-                std::cout << throttle_line << std::endl;
+                std::cout << idle_line << std::endl;
             }
 
             // Power profile
-            std::string profile = read_file(xe_freq_base + "/power_profile");
+            std::string profile = sysfs_read_file(g_xe_freq_base + "/power_profile");
             if (!profile.empty()) {
                 std::string active;
                 size_t bs = profile.find('[');
@@ -1055,18 +850,30 @@ static void refresh() {
                 }
             }
 
-            // GT idle / RC6
-            std::string idle_status = read_file(gt_idle + "/idle_status");
-            long long idle_ms = -1;
-            read_attr(gt_idle, "idle_residency_ms", idle_ms);
-            if (!idle_status.empty()) {
-                std::string idle_line = "     idle:     " + color(idle_status.find("c6") != std::string::npos ? GRN : YEL, idle_status);
-                if (idle_ms > 0) {
-                    int ih = (int)(idle_ms / 3600000);
-                    int im = (int)((idle_ms % 3600000) / 60000);
-                    idle_line += " (" + std::to_string(ih) + "h " + std::to_string(im) + "m residency)";
+            // GT1 (media engine) — min/max freq, profile
+            {
+                std::string gt1_freq_base = g_xe_freq_base.substr(0, g_xe_freq_base.rfind('/'))
+                    + "/gt1/freq0";
+                std::string gt1_cur = sysfs_read_file(gt1_freq_base + "/cur_freq");
+                if (!gt1_cur.empty()) {
+                    std::string gt1_line = "     GT1:    ";
+                    int gt1_min = 0, gt1_max = 0;
+                    sysfs_read_attr(gt1_freq_base, "min_freq", gt1_min);
+                    sysfs_read_attr(gt1_freq_base, "max_freq", gt1_max);
+                    gt1_line += "cur " + gt1_cur + " MHz";
+                    if (gt1_min > 0) gt1_line += " min " + std::to_string(gt1_min) + " MHz";
+                    if (gt1_max > 0) gt1_line += " max " + std::to_string(gt1_max) + " MHz";
+                    if (gt1_max > 0 && gt1_min > 0 && gt1_max <= gt1_min + 10)
+                        gt1_line += color(YEL, " (capped to min_freq)");
+                    std::string gt1_prof = sysfs_read_file(gt1_freq_base + "/power_profile");
+                    if (!gt1_prof.empty()) {
+                        size_t bs = gt1_prof.find('[');
+                        size_t be = gt1_prof.find(']');
+                        if (bs != std::string::npos && be != std::string::npos && be > bs)
+                            gt1_line += " profile: " + color(WHT, gt1_prof.substr(bs + 1, be - bs - 1));
+                    }
+                    std::cout << gt1_line << std::endl;
                 }
-                std::cout << idle_line << std::endl;
             }
 
             // GPU power from uncore RAPL energy delta
@@ -1076,7 +883,7 @@ static void refresh() {
                 static bool first_uncore = true;
 
                 // Find uncore RAPL subdomain dynamically
-                auto uncore_domains = read_rapl_domains();
+                auto uncore_domains = read_all_rapl_domains();
                 std::string uncore_path;
                 for (auto& r : uncore_domains) {
                     if (r.name == "uncore") { uncore_path = r.base_path; break; }
@@ -1084,10 +891,10 @@ static void refresh() {
 
                 long long ue = -1;
                 if (!uncore_path.empty())
-                    read_attr(uncore_path, "energy_uj", ue);
+                    sysfs_read_attr(uncore_path, "energy_uj", ue);
                 if (ue < 0) {
                     // Fallback: direct path for intel-rapl:0:1
-                    read_attr("/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1", "energy_uj", ue);
+                    sysfs_read_attr("/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1", "energy_uj", ue);
                 }
                 if (ue >= 0) {
                     auto now = std::chrono::steady_clock::now();
@@ -1105,16 +912,15 @@ static void refresh() {
                 }
             }
         }
-    }
 
     // 5. intel_pstate & frequency info
     {
         std::string pstate_dir = "/sys/devices/system/cpu/intel_pstate";
-        std::string turbo_pct = read_file(pstate_dir + "/turbo_pct");
-        std::string max_perf = read_file(pstate_dir + "/max_perf_pct");
-        std::string min_perf = read_file(pstate_dir + "/min_perf_pct");
-        std::string no_turbo = read_file(pstate_dir + "/no_turbo");
-        std::string hwp_status = read_file(pstate_dir + "/status");
+        std::string turbo_pct = sysfs_read_file(pstate_dir + "/turbo_pct");
+        std::string max_perf = sysfs_read_file(pstate_dir + "/max_perf_pct");
+        std::string min_perf = sysfs_read_file(pstate_dir + "/min_perf_pct");
+        std::string no_turbo = sysfs_read_file(pstate_dir + "/no_turbo");
+        std::string hwp_status = sysfs_read_file(pstate_dir + "/status");
 
         if (!max_perf.empty()) {
             std::cout << "   P-State:    ";
@@ -1127,7 +933,7 @@ static void refresh() {
 
         // EPB (energy_perf_bias)
         int epb;
-        if (read_attr("/sys/devices/system/cpu/cpu0/power", "energy_perf_bias", epb)) {
+        if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/power", "energy_perf_bias", epb)) {
             const char* epb_label;
             if (epb <= 0)       epb_label = "performance";
             else if (epb <= 4)  epb_label = "balance_performance";
@@ -1140,10 +946,10 @@ static void refresh() {
 
         // Current freq on cpu0 as a quick view
         int cur_freq_khz;
-        if (read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "scaling_cur_freq", cur_freq_khz)) {
+        if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "scaling_cur_freq", cur_freq_khz)) {
             int base_freq_khz;
             std::string freq_str;
-            if (read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "base_frequency", base_freq_khz)) {
+            if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "base_frequency", base_freq_khz)) {
                 std::ostringstream os;
                 os << std::fixed << std::setprecision(1) << (cur_freq_khz / 1000000.0) << "/" << (base_freq_khz / 1000000.0) << " GHz";
                 freq_str = os.str();
@@ -1154,7 +960,7 @@ static void refresh() {
             }
             // Compare against max
             int max_freq_khz;
-            if (read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "cpuinfo_max_freq", max_freq_khz) && max_freq_khz > 0) {
+            if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "cpuinfo_max_freq", max_freq_khz) && max_freq_khz > 0) {
                 double ratio = (double)cur_freq_khz / max_freq_khz;
                 std::ostringstream os;
                 os << std::fixed << std::setprecision(1) << (max_freq_khz / 1000000.0) << " GHz";
@@ -1175,7 +981,7 @@ static void refresh() {
         unsigned long long pkg_now = read_msr(0, 0x6B0);
         unsigned int cur = pkg_now & 0xFFFF;
         bool known_active = false;
-        for (int i = 0; PERF_LIMIT_REASONS[i].name[0]; ++i)
+        for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i)
             if (cur & (1u << PERF_LIMIT_REASONS[i].bit)) { known_active = true; break; }
         if (known_active) {
             std::cout << color(RED, "⚠ PACKAGE THROTTLING ACTIVE — performance is being limited") << std::endl;
@@ -1203,7 +1009,7 @@ static void refresh() {
         bool pl1_clamp = (msr610 >> 16) & 1;
         long long pl1_max = 0;
         // Find first package-0 domain for PL1 max cap info
-        for (auto& rd : read_rapl_domains()) {
+        for (auto& rd : read_all_rapl_domains()) {
             if (rd.name == "package-0" && rd.pl1_max_uw > 0) {
                 pl1_max = rd.pl1_max_uw;
                 break;
@@ -1232,7 +1038,7 @@ static void refresh() {
                     std::string card = de->d_name;
                     if (card.find("card") != 0) continue;
                     std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
-                    if (read_file(candidate + "/cur_freq") != "") {
+                    if (sysfs_read_file(candidate + "/cur_freq") != "") {
                         gpu_freq_path = candidate;
                         break;
                     }
@@ -1240,8 +1046,8 @@ static void refresh() {
                 closedir(drm_tune);
             }
             if (!gpu_freq_path.empty() &&
-                read_attr(gpu_freq_path, "max_freq", gpu_max) &&
-                read_attr(gpu_freq_path, "rp0_freq", gpu_rp0)) {
+                sysfs_read_attr(gpu_freq_path, "max_freq", gpu_max) &&
+                sysfs_read_attr(gpu_freq_path, "rp0_freq", gpu_rp0)) {
                 std::string gpu_tune = "   GPU freq:  max=" + std::to_string(gpu_max) + " MHz  turbo cap=" + std::to_string(gpu_rp0) + " MHz";
                 if (gpu_max < gpu_rp0) gpu_tune += color(YEL, " (apply_max_performance() via forcewake can unlock)");
                 std::cout << gpu_tune << std::endl;
@@ -1252,12 +1058,7 @@ static void refresh() {
     std::cout << std::endl;
 
     // ── Warning banner if discharging ──
-    if (has_battery && battery.status == "Discharging") {
-        std::cout << color(RED, "╔══════════════════════════════════════════════════════════╗") << std::endl;
-        std::cout << color(RED, "║  ⚠ WARNING — Battery is DISCHARGING                    ║") << std::endl;
-        std::cout << color(RED, "║  Plug in your charger to avoid unexpected shutdown.     ║") << std::endl;
-        std::cout << color(RED, "╚══════════════════════════════════════════════════════════╝") << std::endl;
-    }
+    // (removed — battery display removed per user request)
 
     std::cout << "\033[?25h";
 }
