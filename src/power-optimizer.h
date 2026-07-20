@@ -1,19 +1,25 @@
-// power-optimizer.h — Linear constraint optimization for power balancing
+// power-optimizer.h — Utility-maximizing power budget allocator
 //
-// Refactors power-balance.cpp's threshold-driven control logic into a
-// principled optimization problem:
+// Models the power balancer as a constrained optimization problem:
 //
-//   minimize: w1 * thermal_pressure + w2 * throttle_penalty + w3 * performance_loss
+//   maximize  U = α·f_gpu(P_gpu) + β·f_cpu(P_cpu) - γ·h(T) - δ·I(throttle)
 //   subject to:
-//     core_power_w <= pl1_w - gpu_w - headroom
-//     core_power_w >= 0
-//     max_perf_pct in [min_perf_pct, 100]
-//     no_turbo in {0, 1}
-//     EPP_p, EPP_e in {performance, balance_performance, balance_power, power}
-//     n_online_groups >= 2 (safety floor)
+//     P_cpu + P_gpu + H ≤ PL1         (shared power budget)
+//     H = H_base + z·H_nominal        (probabilistic GPU headroom)
+//     P_cpu ∈ [0, P_cpu_max]          (RAPL domain limits)
 //
-// The solver is a fast greedy feasible-point finder — no LP library needed.
-// Each variable has a closed-form solution derived from constraints + objectives.
+// Performance curves: saturating exponential model
+//   f(P) = P_max · (1 - exp(-P / P_scale))
+//
+// Headroom: probabilistic framing with configurable risk parameter z.
+//   H_nominal is a fixed parameter (not learned variance) representing
+//   the typical magnitude of GPU power fluctuation within a polling window.
+//   z scales this to achieve a target risk tolerance.
+//
+// Solver: analytical. The continuous problem (P_cpu allocation) has a closed-form
+// solution derived from equating marginal utilities. The discrete controls
+// (EPP, turbo, hotplug) are enumerated over the small feasible space and
+// evaluated with the continuous optimum for each configuration.
 
 #pragma once
 
@@ -21,27 +27,13 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 
-// ── Configuration constants ──
+// ═══════════════════════════════════════════════════════════
+// EPP levels
+// ═══════════════════════════════════════════════════════════
 
-// Smoothing factor for max_perf_pct (exponential moving average)
-// Prevents rapid fluctuations between cycles — 0.0 = no smoothing, 1.0 = frozen
-static constexpr double MAX_PERF_SMOOTH_ALPHA = 0.5;
-
-// Hysteresis margin for EPP transitions (W of GPU power)
-// Prevents EPP from flapping between levels when GPU power is near a threshold
-static constexpr double EPP_HYSTERESIS_W = 1.0;
-
-// Core power budget constants
-static constexpr double HEADROOM_MARGIN_W    = 2.0;   // base PL1 headroom for GPU
-static constexpr double THERMAL_HEADROOM_R   = 5.0;   // extra headroom per unit pressure (W)
-static constexpr double CRITICAL_CPU_MAX_W   = 8.0;   // max core budget when GPU throttling
-static constexpr double CRITICAL_MAX_PERF    = 20.0;  // min max_perf_pct when GPU throttling
-static constexpr double ACTIVE_MAX_PERF      = 50.0;  // min max_perf_pct when GPU active
-static constexpr double GPU_HEAVY_W          = 15.0;  // GPU power for proportional scaling
-static constexpr int    MIN_CORE_GROUPS            = 2;  // minimum core groups to keep online
-
-// EPP levels (ordered from most performant to most power-efficient)
 enum class EppLevel {
     Performance,          // "performance"
     BalancePerformance,   // "balance_performance"
@@ -49,107 +41,187 @@ enum class EppLevel {
     Power                 // "power"
 };
 
-// Convert EppLevel to string — defined in .cpp to avoid unused-variable/function warnings
 const char* epp_to_string(EppLevel e);
 
-// ── Optimization inputs (observed each cycle) ──
+// ═══════════════════════════════════════════════════════════
+// Configuration: all tunable parameters in one place
+// ═══════════════════════════════════════════════════════════
+
+struct OptimizerConfig {
+    // ── Utility weights ──
+    double alpha = 1.0;   // GPU performance weight
+    double beta  = 1.0;   // CPU performance weight
+    double gamma = 2.0;   // thermal discomfort weight
+    double delta = 10.0;  // throttle event penalty weight
+
+    // ── Performance curves: f(P) = P_max * (1 - exp(-P / P_scale)) ──
+    // CPU performance saturates near P_max_cpu as power increases.
+    // P_scale_cpu controls the "knee" — lower = earlier saturation.
+    double cpu_p_max   = 1.0;   // normalized CPU max performance
+    double cpu_p_scale = 25.0;  // CPU power scale (W)
+
+    // GPU performance saturates near P_max_gpu.
+    // GPU curves are typically more sub-linear than CPU.
+    double gpu_p_max   = 1.0;   // normalized GPU max performance
+    double gpu_p_scale = 20.0;  // GPU power scale (W)
+
+    // ── Probabilistic headroom ──
+    // H = H_base + z * H_nominal + thermal_extra + spike_margin
+    double headroom_base   = 2.0;  // fixed base headroom (W)
+    double headroom_z      = 1.5;  // risk multiplier (z-score analog)
+    double headroom_nominal = 3.0; // nominal fluctuation scale (W) — not learned variance
+
+    // ── Thermal model ──
+    double t_target = 70.0;  // target operating temperature (°C)
+    double t_warn   = 80.0;  // thermal discomfort begins (°C)
+    double t_max    = 90.0;  // thermal ceiling (°C)
+
+    // ── Thermal headroom ──
+    double thermal_headroom_max = 5.0;  // max extra headroom from thermal (W)
+
+    // ── Spike margin ──
+    double spike_ratio = 0.25;  // fraction of GPU power reserved for spikes
+    double spike_min_gpu_w = 3.0;  // only apply spike margin above this GPU power
+
+    // ── CPU control limits ──
+    int cpu_min_perf = 20;     // floor for max_perf_pct
+    int cpu_max_perf = 100;    // ceiling for max_perf_pct
+    double cpu_critical_max_w = 8.0;  // max CPU power when GPU throttling (W)
+
+    // ── Smoothing ──
+    double max_perf_smooth_alpha = 0.5;  // EMA alpha for max_perf_pct
+
+    // ── Safety ──
+    int min_core_groups = 2;  // minimum core groups to keep online
+};
+
+// ═══════════════════════════════════════════════════════════
+// Inputs: observed system state each cycle
+// ═══════════════════════════════════════════════════════════
 
 struct OptimizerInputs {
     // Power budget
-    double pl1_w              = 40.0;   // desired package PL1 limit (W)
-    double gpu_w              = 0.0;    // smoothed GPU power (W)
-    bool   have_gpu           = false;  // GPU detected
+    double pl1_w        = 40.0;   // desired package PL1 limit (W)
+    double gpu_w        = 0.0;    // smoothed GPU power (W)
+    bool   have_gpu     = false;  // GPU detected
 
     // Thermal
-    double temp_c             = -1.0;   // max core temperature (°C), -1 = unknown
+    double temp_c       = -1.0;   // max core temperature (°C), -1 = unknown
+    bool   have_coretemp = false; // thermal sensors available
 
     // GPU state
-    double gpu_c0_pct         = 0.0;    // GPU C0 residency fraction [0, 1]
-    bool   gpu_throttling     = false;  // GPU throttle event detected
+    double gpu_c0_pct   = 0.0;    // GPU C0 residency fraction [0, 1]
+    bool   gpu_throttling = false; // GPU throttle event detected
 
-    // Environmental
-    // System state
-    int    total_core_groups  = 8;      // total physical core groups on system
-    bool   have_coretemp      = false;  // thermal sensors available
+    // System topology
+    int    total_core_groups = 8; // total physical core groups on system
 
-    // Previous cycle state (for smoothing)
-    int    prev_max_perf      = 100;    // previous max_perf_pct
-    EppLevel prev_epp_p       = EppLevel::BalancePerformance;
-    EppLevel prev_epp_e       = EppLevel::BalancePerformance;
+    // Previous cycle state (for smoothing/hysteresis)
+    int    prev_max_perf  = 100;  // previous max_perf_pct
+    EppLevel prev_epp_p   = EppLevel::BalancePerformance;
+    EppLevel prev_epp_e   = EppLevel::BalancePerformance;
+
+    // Optional: reference to config (avoids passing it separately)
+    const OptimizerConfig* config = nullptr;
 };
 
-// ── Optimization outputs (decisions made each cycle) ──
+// ═══════════════════════════════════════════════════════════
+// Outputs: control decisions each cycle
+// ═══════════════════════════════════════════════════════════
 
 struct OptimizerResult {
-    // Power limits
-    double core_power_w       = 0.0;    // RAPL core domain power limit (W)
-    double core_limit_r       = 0.0;    // rounded core limit (125mW granularity)
+    // Power budget allocation
+    double core_power_w     = 0.0;    // optimal CPU power budget (W)
+    double core_limit_r     = 0.0;    // rounded core limit (125mW granularity)
+    double gpu_headroom_w   = 0.0;    // total reserved GPU headroom (W)
+    double thermal_extra_w  = 0.0;    // extra headroom from thermal (W)
 
-    // CPU frequency
-    int    max_perf_pct       = 100;    // intel_pstate max_perf_pct
-    int    no_turbo           = 0;      // intel_pstate no_turbo (0 or 1)
-    int    min_perf_pct       = 8;      // intel_pstate min_perf_pct
+    // CPU frequency controls
+    int    max_perf_pct     = 100;    // intel_pstate max_perf_pct (smoothed)
+    int    raw_max_perf_pct = 100;    // unsmoothed max_perf_pct
+    int    no_turbo         = 0;      // intel_pstate no_turbo (0 or 1)
 
-    // EPP settings
-    EppLevel epp_p            = EppLevel::BalancePerformance;
-    EppLevel epp_e            = EppLevel::BalancePerformance;
+    // CPU energy policy
+    EppLevel epp_p          = EppLevel::BalancePerformance;  // P-core EPP
+    EppLevel epp_e          = EppLevel::BalancePerformance;  // E-core EPP
 
-    // Unsmoothed values (for logging/debug)
-    int    raw_max_perf_pct   = 100;
-    int    raw_no_turbo       = 0;
+    // CPU topology
+    int    keep_groups      = 0;      // core groups to keep online (0 = all)
 
-    // Core groups to keep online (0 = all online)
-    int    keep_groups        = 0;
+    // Diagnostics
+    double util_cpu         = 0.0;    // CPU performance utility component
+    double util_gpu         = 0.0;    // GPU performance utility component
+    double util_thermal     = 0.0;    // thermal discomfort (negative contribution)
+    double util_throttle    = 0.0;    // throttle penalty (negative contribution)
+    double util_total       = 0.0;    // total utility
+    double temp_c           = -1.0;   // max core temp (for logging)
 
-    // Debug info
-    double gpu_headroom_w     = 0.0;    // reserved headroom for GPU (W)
-    double thermal_extra_w    = 0.0;    // extra headroom from thermal constraints (W)
-    double weight_thermal     = 0.0;    // current thermal weight
-    double weight_throttle    = 0.0;    // current throttle weight
-    double weight_performance = 0.0;    // current performance weight
-    double temp_c             = -1.0;   // max core temp (for logging)
+    // Weight diagnostics (for logging)
+    double weight_thermal   = 0.0;
+    double weight_throttle  = 0.0;
+    double weight_performance = 0.0;
 
-    // Apply smoothing to max_perf_pct using previous cycle value
-    int    smooth_max_perf(int prev) const;
+    // Apply smoothing to max_perf_pct
+    int smooth_max_perf(int prev) const;
 
-    // Helper: compute smoothed max_perf_pct from raw and previous value (inline)
-    static int smooth_max_perf_static(int raw, int prev) {
-        return (int)(MAX_PERF_SMOOTH_ALPHA * (double)raw
-                   + (1.0 - MAX_PERF_SMOOTH_ALPHA) * (double)prev);
-    }
+    static int smooth_max_perf_static(int raw, int prev, double alpha);
 };
 
-// ── Core solver function ──
+// ═══════════════════════════════════════════════════════════
+// Performance curve utilities (used by tests and solver)
+// ═══════════════════════════════════════════════════════════
 
-// Solve the optimization problem given current system state.
+// Saturating performance curve: f(P) = P_max * (1 - exp(-P / P_scale))
+double perf_curve(double p_max, double p_scale, double power_w);
+
+// Marginal performance: df/dP = (P_max / P_scale) * exp(-P / P_scale)
+double perf_marginal(double p_max, double p_scale, double power_w);
+
+// Thermal discomfort: smooth step from t_warn to t_max
+double thermal_discomfort(const OptimizerConfig& cfg, double temp_c);
+
+// ═══════════════════════════════════════════════════════════
+// Core solver
+// ═══════════════════════════════════════════════════════════
+
+// Solve the constrained utility maximization problem.
 // Returns the optimal control decisions.
-// This is the main entry point — call once per control cycle.
 OptimizerResult solve(const OptimizerInputs& inputs);
 
-// ── Utility functions (for testing and integration) ──
+// Default configuration
+extern const OptimizerConfig default_config;
 
-// Compute thermal pressure: 0.0 (cold) → 1.0 (at or above 90°C)
-// Linear interpolation between 70°C and 90°C.
+// ═══════════════════════════════════════════════════════════
+// Legacy compatibility helpers (used by tests)
+// ═══════════════════════════════════════════════════════════
+
+// These are kept for backward compatibility with existing tests.
+// They map to the new solver's behavior under default configuration.
+
 double compute_thermal_pressure(double temp_c);
-
-// Compute temperature-based max_perf_pct cap:
-// 70°C → 100%, 90°C → 20%, linear between. Clamped to [20, 100].
-int compute_thermal_max_perf(double temp_c);
-
-// Compute temperature-based no_turbo setting.
-int compute_thermal_no_turbo(double temp_c);
-
-// Compute temperature-based EPP tier.
-int compute_thermal_epp_tier(double temp_c);
-
-// Compute extra headroom from thermal pressure (W).
+int    compute_thermal_max_perf(double temp_c);
+int    compute_thermal_no_turbo(double temp_c);
+int    compute_thermal_epp_tier(double temp_c);
 double compute_thermal_headroom(double temp_c);
 
-// Compute weight schedule from observed conditions.
-// Returns {w_thermal, w_throttle, w_performance}.
+// Legacy weight computation (used for aggression level mapping)
 void compute_weights(const OptimizerInputs& inputs,
                      double& w_thermal, double& w_throttle, double& w_perf);
 
-// Determine aggression level from weights (for logging).
-// Returns 0=idle, 1=active, 2=throttling
 int aggression_from_weights(double w_thermal, double w_throttle, double w_perf);
+
+// Sample and power computation (used by tests)
+struct Sample {
+    long long energy_uj = -1;
+    std::chrono::steady_clock::time_point time;
+};
+
+double compute_power_w(const Sample& prev, const Sample& cur);
+double round_to_125mw(double watts);
+
+// Legacy constants for backward compatibility with power-balance.cpp
+static constexpr double MAX_PERF_SMOOTH_ALPHA = 0.5;
+static constexpr int    MIN_CORE_GROUPS = 2;
+static constexpr double HEADROOM_MARGIN_W = 2.0;
+static constexpr double THERMAL_HEADROOM_R = 5.0;
+static constexpr double CRITICAL_CPU_MAX_W = 8.0;

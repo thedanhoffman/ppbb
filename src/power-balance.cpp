@@ -760,38 +760,12 @@ static double read_max_core_temp(const ThermalState& t) {
     return max_temp;
 }
 
-// ── Thermal constraints ──
-// Temperature-aware overlay: independently constrains CPU controls based on
-// the hottest core.  These are applied as the most-conservative-or-equal
-// override of the aggression-based values.
-struct ThermalConstraints {
-    int    max_perf  = 100;       // thermal cap on max_perf_pct
-    int    no_turbo  = 0;         // force no_turbo?
-    int    epp_tier  = 0;         // 0=aggression-only, 1=balance_power, 2=power
-    double headroom_extra = 0;    // extra PL1 headroom (W) to let CPU cool
-    double temp_c    = -1;        // measured max core temp
-};
-
 // ── Sampling ──
-struct Sample {
-    long long energy_uj = -1;
-    std::chrono::steady_clock::time_point time;
-};
-
 static Sample read_energy(const std::string& dir) {
     Sample s;
     sysfs_read_attr(dir, "energy_uj", s.energy_uj);
     s.time = std::chrono::steady_clock::now();
     return s;
-}
-
-static double compute_power_w(const Sample& prev, const Sample& cur) {
-    if (prev.energy_uj < 0 || cur.energy_uj < 0) return 0;
-    long long delta_uj = cur.energy_uj - prev.energy_uj;
-    if (delta_uj < 0) return -1;
-    auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(cur.time - prev.time).count();
-    if (delta_us <= 0) return -1;
-    return (double)delta_uj / delta_us;
 }
 
 static double read_pl1_w(const RaplDomain& d) {
@@ -1052,12 +1026,13 @@ int main(int argc, char** argv) {
 
         opt_inputs.total_core_groups  = (int)s.cpu.core_groups.size();
         opt_inputs.have_coretemp      = !s.thermal.coretemp_dir.empty();
+        opt_inputs.config             = &default_config;
         // Pass previous state for smoothing/hysteresis
         opt_inputs.prev_max_perf      = prev_max_perf;
         opt_inputs.prev_epp_p         = prev_epp_p;
         opt_inputs.prev_epp_e         = prev_epp_e;
 
-        // ── Debug: log optimizer inputs for diagnostics ──
+        // ── Debug: log optimizer inputs and utility for diagnostics ──
         if (opt_inputs.temp_c >= 0) {
             syslog(LOG_DEBUG, "OPT-IN: pl1=%.1f gpu=%.1f temp=%.1f c0=%.1f throttle=%d",
                    opt_inputs.pl1_w, opt_inputs.gpu_w, opt_inputs.temp_c,
