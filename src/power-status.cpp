@@ -43,10 +43,9 @@ static std::string color(const char* fg, const std::string& text) {
 
 // ── Helpers ──
 
-static int safe_celsius(int raw) { return raw >= 0 ? raw : -1; }
 
 static int detect_cpu_count() {
-    DIR* dir = opendir("/sys/devices/system/cpu");
+    DIR* dir = opendir(SYSFS_CPU_BASE);
     if (!dir) return 8;
     int count = 0;
     struct dirent* entry;
@@ -81,112 +80,8 @@ static std::string current_time_str() {
     return std::string(buf);
 }
 
-// ── Hex formatting ──
-static std::string hex(unsigned long long val, int width) {
-    std::ostringstream os;
-    os << "0x" << std::hex << std::setfill('0') << std::setw(width) << val;
-    return os.str();
-}
-
 // ── Temperature reading ──
-
-static int read_cpu_pkg_temp() {
-    // Try x86_pkg_temp first (most accurate for CPU package).
-    // Fallback to SOC DTS or CPU thermal zones if x86_pkg_temp is not available.
-    // On Meteor Lake, multiple thermal zones may exist; we take the highest temp.
-    DIR* dir = opendir("/sys/class/thermal");
-    if (!dir) return -1;
-    int max_temp = -1;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name[0] == '.') continue;
-        std::string type = sysfs_read_file("/sys/class/thermal/" + name + "/type");
-        if (type == "x86_pkg_temp" || type == "SOC DTS" || type == "CPU") {
-            int t;
-            if (sysfs_read_attr("/sys/class/thermal/" + name, "temp", t)) {
-                int celsius = safe_celsius(t / 1000);
-                if (celsius > max_temp) max_temp = celsius;
-            }
-        }
-    }
-    closedir(dir);
-    return max_temp;
-}
-
-
-
-static int read_gpu_temp() {
-    // Try hwmon first — works for i915, amdgpu, and Xe dGPU.
-    // Xe dGPU hwmon is named "xe" but is only available for discrete GPUs (IS_DGFX).
-    // On integrated GPUs (Meteor Lake iGPU), there is no GPU-specific hwmon.
-    {
-        DIR* hwmon_dir = opendir("/sys/class/hwmon");
-        if (hwmon_dir) {
-            struct dirent* entry;
-            while ((entry = readdir(hwmon_dir)) != nullptr) {
-                std::string name = entry->d_name;
-                if (name[0] == '.') continue;
-                std::string hname = sysfs_read_file("/sys/class/hwmon/" + name + "/name");
-                if (hname.find("i915") != std::string::npos ||
-                    hname.find("amdgpu") != std::string::npos ||
-                    hname.find("xe") != std::string::npos) {
-                    int t;
-                    if (sysfs_read_attr("/sys/class/hwmon/" + name, "temp1_input", t)) {
-                        closedir(hwmon_dir);
-                        return safe_celsius(t / 1000);
-                    }
-                }
-            }
-            closedir(hwmon_dir);
-        }
-    }
-
-    // Fallback: scan thermal zones for GPU-related sensors.
-    // On Meteor Lake iGPU, there is no dedicated GPU thermal zone.
-    // x86_pkg_temp gives package temp (CPU+GPU), which is the closest thing.
-    // SOC DTS / CPU zones may also be relevant.
-    DIR* thermal_dir = opendir("/sys/class/thermal");
-    if (!thermal_dir) return -1;
-    int pkg_temp = -1;
-    struct dirent* entry;
-    while ((entry = readdir(thermal_dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name[0] == '.') continue;
-        std::string type = sysfs_read_file("/sys/class/thermal/" + name + "/type");
-        if (type == "x86_pkg_temp" || type == "SOC DTS" || type == "CPU") {
-            int t;
-            if (sysfs_read_attr("/sys/class/thermal/" + name, "temp", t)) {
-                int celsius = safe_celsius(t / 1000);
-                if (celsius > pkg_temp) pkg_temp = celsius;
-            }
-        }
-    }
-    closedir(thermal_dir);
-    return pkg_temp;
-}
-
-static int read_nvme_temp() {
-    DIR* dir = opendir("/sys/class/hwmon");
-    if (!dir) return -1;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string hwmon = entry->d_name;
-        if (hwmon[0] == '.') continue;
-        std::string name = sysfs_read_file("/sys/class/hwmon/" + hwmon + "/name");
-        if (name.find("nvme") != std::string::npos) {
-            int t;
-            if (sysfs_read_attr("/sys/class/hwmon/" + hwmon, "temp1_input", t)) {
-                closedir(dir);
-                return safe_celsius(t / 1000);
-            }
-        }
-    }
-    closedir(dir);
-    return -1;
-}
-
-
+// Shared functions from power-utils.h: read_cpu_pkg_temp(), read_gpu_temp(), read_nvme_temp()
 
 // ── Global for signal handler ──
 static volatile sig_atomic_t g_running = 1;
@@ -266,13 +161,13 @@ static void init_gpu_throttle() {
             track_gpu_throttle(g_gpu_throttle, g_gpu_throttle_dir);
         return;
     }
-    DIR* drm_dir = opendir("/sys/class/drm");
+    DIR* drm_dir = opendir(SYSFS_DRM);
     if (!drm_dir) return;
     struct dirent* de;
     while ((de = readdir(drm_dir)) != nullptr) {
         std::string card = de->d_name;
         if (card.find("card") != 0) continue;
-        std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
+        std::string candidate = std::string(SYSFS_DRM) + "/" + card + "/device/tile0/gt0/freq0";
         if (sysfs_read_file(candidate + "/cur_freq") != "") {
             g_xe_freq_base = candidate;
             g_gpu_throttle_dir = candidate + "/throttle";
@@ -305,7 +200,7 @@ struct ThrottleStats {
 
 static ThrottleStats read_throttle_stats(int cpu) {
     ThrottleStats s;
-    std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/thermal_throttle";
+    std::string dir = std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(cpu) + "/thermal_throttle";
     sysfs_read_attr(dir, "core_throttle_count", s.core_count);
     sysfs_read_attr(dir, "core_throttle_max_time_ms", s.core_max_ms);
     sysfs_read_attr(dir, "core_throttle_total_time_ms", s.core_total_ms);
@@ -465,7 +360,7 @@ static void refresh() {
 
     // ── Power supply (charger only — battery info removed) ──
     {
-        DIR* ps = opendir("/sys/class/power_supply");
+        DIR* ps = opendir(SYSFS_POWER_SUPPLY);
         std::string charger_name, charger_power_mw;
         bool on_ac = false;
         if (ps) {
@@ -473,18 +368,18 @@ static void refresh() {
             while ((entry = readdir(ps)) != nullptr) {
                 std::string name = entry->d_name;
                 if (name[0] == '.') continue;
-                std::string type = sysfs_read_file("/sys/class/power_supply/" + name + "/type");
+                std::string type = sysfs_read_file(std::string(SYSFS_POWER_SUPPLY) + "/" + name + "/type");
                 if (type == "Mains") {
-                    std::string online = sysfs_read_file("/sys/class/power_supply/" + name + "/online");
+                    std::string online = sysfs_read_file(std::string(SYSFS_POWER_SUPPLY) + "/" + name + "/online");
                     if (online == "1") {
                         on_ac = true;
                         charger_name = name;
                         long long pwr = 0;
-                        sysfs_read_attr("/sys/class/power_supply/" + name, "power_now", pwr);
+                        sysfs_read_attr(std::string(SYSFS_POWER_SUPPLY) + "/" + name, "power_now", pwr);
                         if (pwr > 0) charger_power_mw = std::to_string(pwr / 1000) + " W";
                     }
                 } else if (type == "Battery") {
-                    std::string status = sysfs_read_file("/sys/class/power_supply/" + name + "/status");
+                    std::string status = sysfs_read_file(std::string(SYSFS_POWER_SUPPLY) + "/" + name + "/status");
                     if (status == "Discharging") on_ac = false;
                 }
             }
@@ -532,29 +427,6 @@ static void refresh() {
 
     // ── Performance Limits & Throttling Report ──
     std::cout << color(YEL, "⚙️  Performance Limits & Throttling") << std::endl;
-
-    // ── Helper: format a bitmask as comma-separated reason names ──
-    auto fmt_bits = [](unsigned int bits) -> std::string {
-        std::string r;
-        unsigned int remaining = bits;
-        for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i) {
-            unsigned int m = 1u << PERF_LIMIT_REASONS[i].bit;
-            if (bits & m) {
-                if (!r.empty()) r += ", ";
-                r += PERF_LIMIT_REASONS[i].name;
-                remaining &= ~m;
-            }
-        }
-        if (remaining) {
-            for (int b = 0; b < 16; ++b) {
-                if (remaining & (1u << b)) {
-                    if (!r.empty()) r += ", ";
-                    r += "bit" + std::to_string(b);
-                }
-            }
-        }
-        return r;
-    };
 
     // ── Perf Limit Reasons table ──
     bool msr_ok = msr_available();
@@ -892,7 +764,7 @@ static void refresh() {
                 auto uncore_domains = read_all_rapl_domains();
                 std::string uncore_path;
                 for (auto& r : uncore_domains) {
-                    if (r.name == "uncore") { uncore_path = r.base_path; break; }
+                    if (r.name == "uncore") { uncore_path = r.path; break; }
                 }
 
                 long long ue = -1;
@@ -900,7 +772,7 @@ static void refresh() {
                     sysfs_read_attr(uncore_path, "energy_uj", ue);
                 if (ue < 0) {
                     // Fallback: direct path for intel-rapl:0:1
-                    sysfs_read_attr("/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1", "energy_uj", ue);
+                    sysfs_read_attr(std::string(SYSFS_RAPL) + "/intel-rapl:0/intel-rapl:0:1", "energy_uj", ue);
                 }
                 if (ue >= 0) {
                     auto now = std::chrono::steady_clock::now();
@@ -921,7 +793,7 @@ static void refresh() {
 
     // 5. intel_pstate & frequency info
     {
-        std::string pstate_dir = "/sys/devices/system/cpu/intel_pstate";
+        std::string pstate_dir = SYSFS_PSTATE_DIR;
         std::string turbo_pct = sysfs_read_file(pstate_dir + "/turbo_pct");
         std::string max_perf = sysfs_read_file(pstate_dir + "/max_perf_pct");
         std::string min_perf = sysfs_read_file(pstate_dir + "/min_perf_pct");
@@ -939,7 +811,7 @@ static void refresh() {
 
         // EPB (energy_perf_bias)
         int epb;
-        if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/power", "energy_perf_bias", epb)) {
+        if (sysfs_read_attr(std::string(SYSFS_CPU_BASE) + "/cpu0/power", "energy_perf_bias", epb)) {
             const char* epb_label;
             if (epb <= 0)       epb_label = "performance";
             else if (epb <= 4)  epb_label = "balance_performance";
@@ -952,10 +824,10 @@ static void refresh() {
 
         // Current freq on cpu0 as a quick view
         int cur_freq_khz;
-        if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "scaling_cur_freq", cur_freq_khz)) {
+        if (sysfs_read_attr(std::string(SYSFS_CPU_BASE) + "/cpu0/cpufreq", "scaling_cur_freq", cur_freq_khz)) {
             int base_freq_khz;
             std::string freq_str;
-            if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "base_frequency", base_freq_khz)) {
+            if (sysfs_read_attr(std::string(SYSFS_CPU_BASE) + "/cpu0/cpufreq", "base_frequency", base_freq_khz)) {
                 std::ostringstream os;
                 os << std::fixed << std::setprecision(1) << (cur_freq_khz / 1000000.0) << "/" << (base_freq_khz / 1000000.0) << " GHz";
                 freq_str = os.str();
@@ -966,7 +838,7 @@ static void refresh() {
             }
             // Compare against max
             int max_freq_khz;
-            if (sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "cpuinfo_max_freq", max_freq_khz) && max_freq_khz > 0) {
+            if (sysfs_read_attr(std::string(SYSFS_CPU_BASE) + "/cpu0/cpufreq", "cpuinfo_max_freq", max_freq_khz) && max_freq_khz > 0) {
                 double ratio = (double)cur_freq_khz / max_freq_khz;
                 std::ostringstream os;
                 os << std::fixed << std::setprecision(1) << (max_freq_khz / 1000000.0) << " GHz";
@@ -1037,13 +909,13 @@ static void refresh() {
             // Check GPU max_freq writability — find Xe GT0 freq0 path dynamically
             int gpu_max = 0, gpu_rp0 = 0;
             std::string gpu_freq_path;
-            DIR* drm_tune = opendir("/sys/class/drm");
+            DIR* drm_tune = opendir(SYSFS_DRM);
             if (drm_tune) {
                 struct dirent* de;
                 while ((de = readdir(drm_tune)) != nullptr) {
                     std::string card = de->d_name;
                     if (card.find("card") != 0) continue;
-                    std::string candidate = "/sys/class/drm/" + card + "/device/tile0/gt0/freq0";
+                    std::string candidate = std::string(SYSFS_DRM) + "/" + card + "/device/tile0/gt0/freq0";
                     if (sysfs_read_file(candidate + "/cur_freq") != "") {
                         gpu_freq_path = candidate;
                         break;

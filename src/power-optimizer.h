@@ -88,6 +88,10 @@ struct OptimizerConfig {
     int cpu_max_perf = 100;    // ceiling for max_perf_pct
     double cpu_critical_max_w = 8.0;  // max CPU power when GPU throttling (W)
 
+    // ── GPU thresholds ──
+    double heavy_gpu_w_threshold = 15.0;  // GPU power above this triggers throttle weights
+    double gpu_power_smooth_alpha = 0.3;  // EMA alpha for GPU power smoothing
+
     // ── Smoothing ──
     double max_perf_smooth_alpha = 0.5;  // EMA alpha for max_perf_pct
 

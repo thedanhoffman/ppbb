@@ -33,8 +33,6 @@ static constexpr double   DEFAULT_PL1_W        = 40.0;
 static constexpr int      INTERVAL_MS          = 500;
 // GPU activity tracking: C0 residency (c0_pct 0.0–1.0) over 500ms window
 // Drives weight schedule in power-optimizer: idle/active/heavy/throttling.
-// Fallback: when C0 sysfs is unavailable, gpu_w > GPU_HEAVY_W (15W) triggers
-// at-least "active" weights to prevent idle CPU + high GPU power combos.
 //
 // GT1 power minimization (TODO #3 done):
 //   GT0 (graphics) locked in power_saving via set_gt0_profile()
@@ -44,22 +42,12 @@ static constexpr int      INTERVAL_MS          = 500;
 // Dynamic RAPL domains (TODO #2 done):
 //   all_rapl_domains tracks every discovered subdomain (dram, pp0, etc.)
 //   Core budget applied to all non-uncore domains; uncore left unlimited
-static constexpr double   GPU_ACTIVE_W         = 3.0;
-static constexpr double   SMOOTH_ALPHA         = 0.3;
 static constexpr long     PP0_TIME_WINDOW_US   = 500;
 
 // ── Data-only structs ──
 // All runtime state lives in one global (SystemState).  Each sub-struct owns
 // its own data; free functions below operate on the structs by reference.
-
-// RAPL powercap domain
-struct RaplDomain {
-    std::string path;          // /sys/class/powercap/intel-rapl/domain-N
-    bool        valid = false;
-    std::string domain_type;   // "core", "uncore", "dram", "pp0", etc.
-    double      pl4_w = 0;     // PL4 peak power limit (W), 0 = not supported
-    double      max_w = 0;     // constraint_0_max_power_uw (W), 0 = not supported
-};
+// RAPL domain type is the shared RaplDomain from power-utils.h.
 
 // GPU throttle event tracking
 struct GpuThrottleCounters {
@@ -93,8 +81,8 @@ struct GpuState {
     bool        gt1_freq_capped        = false;  // true when max_freq capped to min_freq
 
     // C0 residency-based GPU activity tracking (TODO #1)
-    // Replaces hardcoded GPU_ACTIVE_W/GPU_HEAVY_W thresholds with
-    // residency percentage, which is much more portable across GPUs.
+    // Uses residency percentage instead of power thresholds for
+    // portability across GPUs.
     bool        has_c0_residency = false;  // true when c0_residency_path is populated
     std::string c0_residency_path; // gt0/activity/c0_residency_ms
     long long   last_c0_residency_us = 0; // microseconds, last read value
@@ -207,7 +195,7 @@ static void rapl_set_enabled(const RaplDomain& d, bool on) {
 // Used during initialization to enable all domains, and during cleanup to reset them.
 static void rapl_set_all(const std::vector<RaplDomain>& domains, double watts_w) {
     for (auto& d : domains) {
-        double val = (watts_w == 0.0 && d.max_w > 0) ? d.max_w : watts_w;
+        double val = (watts_w == 0.0 && d.max_w() > 0) ? d.max_w() : watts_w;
         rapl_set_power_limit(d, val);
     }
 }
@@ -218,101 +206,55 @@ static void rapl_enable_all(const std::vector<RaplDomain>& domains) {
 }
 
 // ── RAPL discovery ──
-// Discovers ALL RAPL subdomains (core, uncore, dram, pp0, pp1, etc.),
-// populating both the typed fields and a flat all_rapl_domains list.
+// Uses shared scan_rapl_domains() from power-utils.h to discover all domains,
+// then populates daemon-specific typed fields (pkg, core, uncore, etc.).
 
 static bool discover_rapl(SystemState& s) {
-    for (const char* root : {"intel-rapl", "intel-rapl-mmio"}) {
-        std::string base = std::string("/sys/class/powercap/") + root;
-        DIR* dir = opendir(base.c_str());
-        if (!dir) continue;
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != nullptr) {
-            std::string name = entry->d_name;
-            if (name[0] == '.') continue;
-            std::string path = base + "/" + name;
-            std::string rname = sysfs_read_file(path + "/name");
-            if (rname.find("package-") != std::string::npos) {
-                if (std::string(root) == "intel-rapl-mmio")
-                    s.pkg_mmio.path = path;
-                else
-                    s.pkg.path = path;
-                // Scan subdomains (only for intel-rapl, not mmio)
-                DIR* sdir = opendir(path.c_str());
-                if (sdir) {
-                    struct dirent* se;
-                    while ((se = readdir(sdir)) != nullptr) {
-                        std::string sn = se->d_name;
-                        if (sn[0] == '.') continue;
-                        std::string sp = path + "/" + sn;
-                        std::string sr = sysfs_read_file(sp + "/name");
-                        if (sr.empty()) continue;
-                        RaplDomain sub;
-                        sub.path = sp;
-                        sub.domain_type = sr;
-                        sub.valid = true;
-                        // Read PL4 peak power limit (constraint_2) if supported
-                        long long pl4_uw = 0;
-                        if (sysfs_read_attr(sp, "constraint_2_power_limit_uw", pl4_uw)
-                                && pl4_uw > 0)
-                            sub.pl4_w = pl4_uw / 1e6;
-                        // Read max power (constraint_0_max) for "unlimited" writes
-                        long long max_uw = 0;
-                        if (sysfs_read_attr(sp, "constraint_0_max_power_uw", max_uw)
-                                && max_uw > 0)
-                            sub.max_w = max_uw / 1e6;
-                        // Also set typed fields for backward compat
-                        if (sr == "core") { s.core = sub; }
-                        else if (sr == "uncore") { s.uncore = sub; }
-                        // Store in all_domains for dynamic control
-                        s.all_rapl_domains.push_back(sub);
-                    }
-                    closedir(sdir);
-                }
+    // Scan all RAPL domains using shared function
+    std::vector<RaplDomain> all_domains = read_all_rapl_domains();
+
+    for (auto& d : all_domains) {
+        // Identify package domains
+        if (d.name.find("package-") != std::string::npos) {
+            if (d.path.find("intel-rapl-mmio") != std::string::npos) {
+                s.pkg_mmio = d;
+            } else if (s.pkg.path.empty()) {
+                s.pkg = d;
             }
         }
-        closedir(dir);
+        // Typed subdomains
+        else if (d.name == "core") { s.core = d; }
+        else if (d.name == "uncore") { s.uncore = d; }
+        else {
+            s.all_rapl_domains.push_back(d);
+        }
     }
+
     // Mark valid
     s.pkg.valid = !s.pkg.path.empty();
     s.pkg_mmio.valid = !s.pkg_mmio.path.empty();
     s.core.valid = !s.core.path.empty();
     s.uncore.valid = !s.uncore.path.empty();
 
-    // Read package PL4 (constraint_2) and max power if supported
-    long long pkg_pl4_uw = 0;
-    if (s.pkg.valid && sysfs_read_attr(s.pkg.path, "constraint_2_power_limit_uw", pkg_pl4_uw)
-            && pkg_pl4_uw > 0)
-        s.pkg.pl4_w = pkg_pl4_uw / 1e6;
-    long long pkg_max_uw = 0;
-    if (s.pkg.valid && sysfs_read_attr(s.pkg.path, "constraint_0_max_power_uw", pkg_max_uw)
-            && pkg_max_uw > 0)
-        s.pkg.max_w = pkg_max_uw / 1e6;
-    long long pkg_mmio_max_uw = 0;
-    if (s.pkg_mmio.valid && sysfs_read_attr(s.pkg_mmio.path, "constraint_0_max_power_uw", pkg_mmio_max_uw)
-            && pkg_mmio_max_uw > 0)
-        s.pkg_mmio.max_w = pkg_mmio_max_uw / 1e6;
-
     // Log discovered domains
     char log_pl4[64] = "";
-    if (s.core.pl4_w > 0)
-        snprintf(log_pl4, sizeof(log_pl4), " core_pl4=%.1fW", s.core.pl4_w);
-    else if (s.pkg.pl4_w > 0)
-        snprintf(log_pl4, sizeof(log_pl4), " pkg_pl4=%.1fW", s.pkg.pl4_w);
-    syslog(LOG_INFO, "RAPL: pkg=%s pkg_mmio=%s core=%s uncore=%s dram=%s%s",
+    if (s.core.pl4_w() > 0)
+        snprintf(log_pl4, sizeof(log_pl4), " core_pl4=%.1fW", s.core.pl4_w());
+    else if (s.pkg.pl4_w() > 0)
+        snprintf(log_pl4, sizeof(log_pl4), " pkg_pl4=%.1fW", s.pkg.pl4_w());
+    syslog(LOG_INFO, "RAPL: pkg=%s pkg_mmio=%s core=%s uncore=%s%s",
            s.pkg.path.c_str(),
            s.pkg_mmio.path.empty() ? "n/a" : s.pkg_mmio.path.c_str(),
            s.core.path.c_str(),
            s.uncore.path.empty() ? "n/a" : s.uncore.path.c_str(),
-           s.core.path.empty() ? "n/a" : s.core.path.c_str(),
            log_pl4);
-    if (s.all_rapl_domains.size() > 2) {
+    if (!s.all_rapl_domains.empty()) {
         std::string types;
         for (auto& d : s.all_rapl_domains) {
             if (!types.empty()) types += ", ";
-            types += d.domain_type + "=" + d.path;
+            types += d.name;
         }
-        syslog(LOG_INFO, "RAPL all domains: %s", types.c_str());
+        syslog(LOG_INFO, "RAPL subdomains: %s", types.c_str());
     }
 
     return s.pkg.valid;
@@ -321,7 +263,7 @@ static bool discover_rapl(SystemState& s) {
 // ── GPU path discovery ──
 
 static void discover_gpu(SystemState& s) {
-    DIR* drm = opendir("/sys/class/drm");
+    DIR* drm = opendir(SYSFS_DRM);
     if (!drm) return;
     struct dirent* de;
     while ((de = readdir(drm)) != nullptr) {
@@ -376,9 +318,10 @@ static void gpu_read_c0_residency(GpuState& g) {
     g._last_c0_time_us = now_us;
 }
 
-// Compute residency-based aggression from C0 percentage.
-// Returns aggression level: 0=idle, 1=active, 2=heavy
-static int gpu_throttle_events(const GpuState& g, GpuThrottleCounters* counters) {
+// Check GPU throttle reasons and accumulate event counters.
+// Returns 1 if any non-power-limit throttle reason is active (i > 3), 0 otherwise.
+// The name gpu_get_throttle_state() clarifies this is a status check, not a count.
+static int gpu_get_throttle_state(const GpuState& g, GpuThrottleCounters* counters) {
     if (g.gt0.empty()) return 0;
     std::string throttle_dir = g.gt0 + "/freq0/throttle";
     int any = 0;
@@ -421,11 +364,8 @@ static void set_gt1_profile(const GpuState& g, const std::string& profile) {
         sysfs_write_str(path, profile);
 }
 
-// ── CPU control paths ──
-static const std::string PSTATE_DIR    = "/sys/devices/system/cpu/intel_pstate";
-static const std::string PSTATE_MAX    = PSTATE_DIR + "/max_perf_pct";
-static const std::string PSTATE_MIN    = PSTATE_DIR + "/min_perf_pct";
-static const std::string PSTATE_NOTURBO = PSTATE_DIR + "/no_turbo";
+// ── CPU control paths (shared constants from power-utils.h) ──
+// PSTATE_DIR, PSTATE_MAX, PSTATE_MIN, PSTATE_NOTURBO are in power-utils.h
 
 // ── EPP management ──
 // Track last-set values per-cluster to avoid redundant sysfs writes.
@@ -459,16 +399,16 @@ static void discover_clusters(CpuState& c) {
     int global_max_freq = 0;
     std::vector<std::pair<std::string, int>> cpus;
 
-    DIR* dir = opendir("/sys/devices/system/cpu");
+    DIR* dir = opendir(SYSFS_CPU_BASE);
     if (!dir) return;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
         if (name.find("cpu") != 0) continue;
-        std::string epp = "/sys/devices/system/cpu/" + name + "/cpufreq/energy_performance_preference";
+        std::string epp = std::string(SYSFS_CPU_BASE) + "/" + name + "/cpufreq/energy_performance_preference";
         int max_freq = 0;
         if (sysfs_read_file(epp) == "") continue;
-        sysfs_read_attr("/sys/devices/system/cpu/" + name + "/cpufreq", "cpuinfo_max_freq", max_freq);
+        sysfs_read_attr(std::string(SYSFS_CPU_BASE) + "/" + name + "/cpufreq", "cpuinfo_max_freq", max_freq);
         if (max_freq > global_max_freq) global_max_freq = max_freq;
         cpus.push_back({epp, max_freq});
     }
@@ -496,7 +436,7 @@ static void discover_clusters(CpuState& c) {
 static int count_online_groups(const CpuState& c) {
     int n = 0;
     for (auto& g : c.core_groups) {
-        std::string s = sysfs_read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+        std::string s = sysfs_read_file(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(g.cpus[0]) + "/online");
         if (s != "0") n++;
     }
     return n;
@@ -505,7 +445,7 @@ static int count_online_groups(const CpuState& c) {
 static void discover_topology(CpuState& c) {
     // Build core groups: CPUs sharing the same physical core
     std::map<int, std::vector<int>> core_map;
-    DIR* dir = opendir("/sys/devices/system/cpu");
+    DIR* dir = opendir(SYSFS_CPU_BASE);
     if (!dir) return;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
@@ -617,15 +557,17 @@ static void apply_hotplug(CpuState& c, int keep_groups_target_from_optimizer) {
     bool changed = false;
     for (int i = 0; i < total; ++i) {
         auto& g = c.core_groups[i];
-        std::string s = sysfs_read_file("/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+        std::string s = sysfs_read_file(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(g.cpus[0]) + "/online");
         bool is_online = (s != "0");
         if (is_online && !should_online[i]) {
             for (int cp : g.cpus)
-                sysfs_write_int("/sys/devices/system/cpu/cpu" + std::to_string(cp) + "/online", 0);
+                if (!sysfs_write_int(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(cp) + "/online", 0))
+                    syslog(LOG_WARNING, "failed to offline cpu%d", cp);
             changed = true;
         } else if (!is_online && should_online[i]) {
             for (int cp : g.cpus)
-                sysfs_write_int("/sys/devices/system/cpu/cpu" + std::to_string(cp) + "/online", 1);
+                if (!sysfs_write_int(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(cp) + "/online", 1))
+                    syslog(LOG_WARNING, "failed to online cpu%d", cp);
             changed = true;
         }
     }
@@ -643,7 +585,7 @@ static void restore_online_state(const CpuState& c) {
     for (auto& g : c.core_groups) {
         for (int cp : g.cpus) {
             if (g.saved_online)
-                sysfs_write_int("/sys/devices/system/cpu/cpu" + std::to_string(cp) + "/online", 1);
+                sysfs_write_int(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(cp) + "/online", 1);
         }
     }
     syslog(LOG_INFO, "restored CPU online state");
@@ -652,9 +594,9 @@ static void restore_online_state(const CpuState& c) {
 // ── Saved state (restored on exit) ──
 
 static void save_cpu_state(SystemState& s) {
-    sysfs_read_attr(PSTATE_DIR, "max_perf_pct", s.saved.max_perf);
-    sysfs_read_attr(PSTATE_DIR, "min_perf_pct", s.saved.min_perf);
-    sysfs_read_attr(PSTATE_DIR, "no_turbo", s.saved.no_turbo);
+    sysfs_read_attr(SYSFS_PSTATE_DIR, "max_perf_pct", s.saved.max_perf);
+    sysfs_read_attr(SYSFS_PSTATE_DIR, "min_perf_pct", s.saved.min_perf);
+    sysfs_read_attr(SYSFS_PSTATE_DIR, "no_turbo", s.saved.no_turbo);
     if (!s.cpu.pcore_epp_paths.empty())
         s.saved.epp = sysfs_read_file(s.cpu.pcore_epp_paths[0]);
     s.gpu.saved_profile_gt0 = s.gpu.gt0.empty() ? "" : sysfs_read_file(s.gpu.gt0 + "/freq0/power_profile");
@@ -668,9 +610,9 @@ static void save_cpu_state(SystemState& s) {
 }
 
 static void restore_cpu_state(const SystemState& s) {
-    sysfs_write_int(PSTATE_MAX, s.saved.max_perf);
-    sysfs_write_int(PSTATE_MIN, s.saved.min_perf);
-    sysfs_write_int(PSTATE_NOTURBO, s.saved.no_turbo);
+    sysfs_write_int(SYSFS_PSTATE_MAX, s.saved.max_perf);
+    sysfs_write_int(SYSFS_PSTATE_MIN, s.saved.min_perf);
+    sysfs_write_int(SYSFS_PSTATE_NOTURBO, s.saved.no_turbo);
     if (!s.saved.epp.empty())
         cpu_set_epp_all(s.cpu, s.saved.epp);
     if (!s.gpu.saved_profile_gt0.empty()) sysfs_write_str(s.gpu.gt0 + "/freq0/power_profile", s.gpu.saved_profile_gt0);
@@ -695,14 +637,35 @@ static void track_perf_limits(PerfLimitCounters& pl, int cpu) {
 
 // ── Temperature ──
 
-static void discover_coretemp(ThermalState& t) {
-    DIR* hwmon = opendir("/sys/class/hwmon");
-    if (!hwmon) return;
+static void discover_thermal(ThermalState& t) {
+    // Use shared temperature function — read_cpu_pkg_temp() scans thermal zones
+    // and hwmon for CPU temperature.  We still discover coretemp dir for
+    // per-core temperature display and intel_powerclamp for restore on exit.
+    DIR* hwmon = opendir(SYSFS_HWMON);
+    if (!hwmon) {
+        // Discover intel_powerclamp via thermal zones
+        DIR* therm = opendir(SYSFS_THERMAL);
+        if (!therm) return;
+        struct dirent* entry;
+        while ((entry = readdir(therm)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name.find("cooling_device") != 0) continue;
+            std::string path = std::string(SYSFS_THERMAL) + "/" + name;
+            if (sysfs_read_file(path + "/type") == "intel_powerclamp") {
+                t.powerclamp_dev = path;
+                sysfs_read_attr(t.powerclamp_dev, "cur_state", t.saved_powerclamp_state);
+                syslog(LOG_INFO, "intel_powerclamp=%s (saved state=%d)", path.c_str(), t.saved_powerclamp_state);
+                break;
+            }
+        }
+        closedir(therm);
+        return;
+    }
     struct dirent* entry;
     while ((entry = readdir(hwmon)) != nullptr) {
         std::string name = entry->d_name;
         if (name[0] == '.') continue;
-        std::string path = std::string("/sys/class/hwmon/") + name;
+        std::string path = std::string(SYSFS_HWMON) + "/" + name;
         if (sysfs_read_file(path + "/name") == "coretemp") {
             t.coretemp_dir = path;
             break;
@@ -710,12 +673,12 @@ static void discover_coretemp(ThermalState& t) {
     }
     closedir(hwmon);
     // Discover intel_powerclamp
-    DIR* therm = opendir("/sys/class/thermal");
+    DIR* therm = opendir(SYSFS_THERMAL);
     if (!therm) return;
     while ((entry = readdir(therm)) != nullptr) {
         std::string name = entry->d_name;
         if (name.find("cooling_device") != 0) continue;
-        std::string path = std::string("/sys/class/thermal/") + name;
+        std::string path = std::string(SYSFS_THERMAL) + "/" + name;
         if (sysfs_read_file(path + "/type") == "intel_powerclamp") {
             t.powerclamp_dev = path;
             sysfs_read_attr(t.powerclamp_dev, "cur_state", t.saved_powerclamp_state);
@@ -726,24 +689,32 @@ static void discover_coretemp(ThermalState& t) {
     closedir(therm);
 }
 
+// Read max core temperature — uses shared function from power-utils.
+// Falls back to coretemp hwmon for per-core granularity.
 static double read_max_core_temp(const ThermalState& t) {
-    if (t.coretemp_dir.empty()) return -1;
-    DIR* dir = opendir(t.coretemp_dir.c_str());
-    if (!dir) return -1;
-    double max_temp = -1;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string fn = entry->d_name;
-        if (fn.find("temp") == 0 && fn.size() > 5 && fn.find("_input") != std::string::npos) {
-            std::string val = sysfs_read_file(t.coretemp_dir + "/" + fn);
-            if (!val.empty()) {
-                double tval = std::stod(val) / 1000.0;
-                if (tval > max_temp) max_temp = tval;
+    // Try coretemp hwmon first (per-core granularity)
+    if (!t.coretemp_dir.empty()) {
+        DIR* dir = opendir(t.coretemp_dir.c_str());
+        if (dir) {
+            double max_temp = -1;
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string fn = entry->d_name;
+                if (fn.find("temp") == 0 && fn.size() > 5 && fn.find("_input") != std::string::npos) {
+                    std::string val = sysfs_read_file(t.coretemp_dir + "/" + fn);
+                    if (!val.empty()) {
+                        double tval = std::stod(val) / 1000.0;
+                        if (tval > max_temp) max_temp = tval;
+                    }
+                }
             }
+            closedir(dir);
+            if (max_temp >= 0) return max_temp;
         }
     }
-    closedir(dir);
-    return max_temp;
+    // Fallback: shared thermal zone scanner
+    int t_c = read_cpu_pkg_temp();
+    return t_c >= 0 ? (double)t_c : -1.0;
 }
 
 // ── Sampling ──
@@ -793,7 +764,7 @@ static void assess_gpu_state(const GpuState& g, bool have_gpu, bool settle,
     active = false;
     if (settle) return;
     if (have_gpu) {
-        throttling = (gpu_throttle_events(g, &tc) != 0);
+        throttling = (gpu_get_throttle_state(g, &tc) != 0);
         active = gpu_is_active(g);
     }
 }
@@ -880,9 +851,9 @@ int main(int argc, char** argv) {
     // Build a compact list of additional domains beyond pkg/core/uncore
     std::string extra_domains;
     for (auto& d : s.all_rapl_domains) {
-        if (d.domain_type != "core" && d.domain_type != "uncore") {
+        if (d.name != "core" && d.name != "uncore") {
             if (!extra_domains.empty()) extra_domains += ", ";
-            extra_domains += d.domain_type;
+            extra_domains += d.name;
         }
     }
     syslog(LOG_INFO, "RAPL pkg=%s core=%s uncore=%s mmio=%s%s",
@@ -891,7 +862,7 @@ int main(int argc, char** argv) {
            s.uncore.path.empty() ? "?" : s.uncore.path.c_str(),
            s.pkg_mmio.path.empty() ? "?" : s.pkg_mmio.path.c_str(),
            extra_domains.empty() ? "" : (" extra(" + extra_domains + ")").c_str());
-    discover_coretemp(s.thermal);
+    discover_thermal(s.thermal);
 
     bool have_gpu = !s.gpu.gt0.empty();
     if (have_gpu) {
@@ -921,8 +892,8 @@ int main(int argc, char** argv) {
     // Cap at package PL4 if present — exceeding PL4 triggers MSR 0x690 bit 11.
     {
         double effective_pl1 = pl1_w;
-        if (s.pkg.pl4_w > 0) {
-            effective_pl1 = std::min(effective_pl1, s.pkg.pl4_w);
+        if (s.pkg.pl4_w() > 0) {
+            effective_pl1 = std::min(effective_pl1, s.pkg.pl4_w());
             if (effective_pl1 < pl1_w)
                 syslog(LOG_INFO, "package PL1 clamped to PL4: %.1fW → %.1fW",
                        pl1_w, effective_pl1);
@@ -996,7 +967,7 @@ int main(int argc, char** argv) {
 
         if (pkg_w < 0) continue;
         if (first) { smoothed_gpu_w = gpu_w; first = false; }
-        smoothed_gpu_w = SMOOTH_ALPHA * gpu_w + (1.0 - SMOOTH_ALPHA) * smoothed_gpu_w;
+        smoothed_gpu_w = default_config.max_perf_smooth_alpha * gpu_w + (1.0 - default_config.max_perf_smooth_alpha) * smoothed_gpu_w;
 
 
 
@@ -1043,7 +1014,7 @@ int main(int argc, char** argv) {
         // Issue #5: pass measured CPU power instead of a guess
         opt_inputs.cpu_measured_w     = core_w;
         // Issue #9: pass RAPL core domain max limit
-        opt_inputs.cpu_domain_max_w   = s.core.valid ? s.core.max_w : 0.0;
+        opt_inputs.cpu_domain_max_w   = s.core.valid ? s.core.max_w() : 0.0;
 
         opt_inputs.total_core_groups  = (int)s.cpu.core_groups.size();
         opt_inputs.have_coretemp      = !s.thermal.coretemp_dir.empty();
@@ -1072,20 +1043,20 @@ int main(int argc, char** argv) {
             // the core RAPL budget must not exceed it — otherwise the core hits PL4
             // and triggers MSR 0x690 bit 11 (Package PL4/Peak perf limit reason).
             double core_limit = opt.core_limit_r;
-            if (s.core.pl4_w > 0)
-                core_limit = std::min(core_limit, s.core.pl4_w);
+            if (s.core.pl4_w() > 0)
+                core_limit = std::min(core_limit, s.core.pl4_w());
             rapl_set_power_limit(s.core, core_limit);
         }
         if (s.uncore.valid)
-            rapl_set_power_limit(s.uncore, s.uncore.max_w > 0 ? s.uncore.max_w : 0.0);
+            rapl_set_power_limit(s.uncore, s.uncore.max_w() > 0 ? s.uncore.max_w() : 0.0);
 
         // ── MMIO package PL1 ──
         // Raise MMIO PL1 to match MSR PL1 so it doesn't become a bottleneck.
         // Cap at package PL4 if present — exceeding PL4 triggers MSR 0x690 bit 11.
         {
             double effective_pl1 = pl1_w;
-            if (s.pkg.pl4_w > 0)
-                effective_pl1 = std::min(effective_pl1, s.pkg.pl4_w);
+            if (s.pkg.pl4_w() > 0)
+                effective_pl1 = std::min(effective_pl1, s.pkg.pl4_w());
             if (s.pkg_mmio.valid) {
                 long long mmio_now = 0;
                 sysfs_read_attr(s.pkg_mmio.path, "constraint_0_power_limit_uw", mmio_now);
@@ -1099,11 +1070,17 @@ int main(int argc, char** argv) {
         clear_prochot_msr(msr_ok);
 
         // ── CPU frequency control (from optimizer) ──
-        sysfs_write_int(PSTATE_MAX, opt.max_perf_pct);
-        sysfs_write_int(PSTATE_NOTURBO, opt.no_turbo);
+        if (!sysfs_write_int(SYSFS_PSTATE_MAX, opt.max_perf_pct)) {
+            syslog(LOG_WARNING, "failed to write max_perf_pct=%d", opt.max_perf_pct);
+        }
+        if (!sysfs_write_int(SYSFS_PSTATE_NOTURBO, opt.no_turbo)) {
+            syslog(LOG_WARNING, "failed to write no_turbo=%d", opt.no_turbo);
+        }
         int min_perf = (opt.keep_groups > 0 && opt.keep_groups < (int)s.cpu.core_groups.size())
                        ? 0 : s.saved.min_perf;
-        sysfs_write_int(PSTATE_MIN, min_perf);
+        if (!sysfs_write_int(SYSFS_PSTATE_MIN, min_perf)) {
+            syslog(LOG_WARNING, "failed to write min_perf_pct=%d", min_perf);
+        }
 
         // ── EPP (from optimizer) ──
         cpu_set_epp(s.cpu, epp_to_string(opt.epp_p), epp_to_string(opt.epp_e));

@@ -22,17 +22,28 @@ std::string sysfs_read_file(const std::string& path) {
     return content;
 }
 
-void sysfs_write_file(const std::string& path, const std::string& content) {
-    sysfs_write_str(path, content + "\n");
+bool sysfs_write_file(const std::string& path, const std::string& content) {
+    return sysfs_write_str(path, content + "\n");
 }
 
-void sysfs_write_str(const std::string& path, const std::string& val) {
+bool sysfs_write_str(const std::string& path, const std::string& val) {
     std::ofstream f(path);
-    if (f.is_open()) f << val;
+    if (!f.is_open()) return false;
+    f << val;
+    return !f.fail();
 }
 
-void sysfs_write_int(const std::string& path, long long val) {
-    sysfs_write_str(path, std::to_string(val));
+bool sysfs_write_int(const std::string& path, long long val) {
+    return sysfs_write_str(path, std::to_string(val));
+}
+
+bool sysfs_write_int_if_changed(const std::string& path, long long val) {
+    std::string current = sysfs_read_file(path);
+    if (current.empty()) return false;
+    long long existing = 0;
+    std::istringstream(current) >> existing;
+    if (existing == val) return true; // already correct
+    return sysfs_write_int(path, val);
 }
 
 // ── MSR access ──
@@ -44,31 +55,9 @@ bool msr_available() {
     return true;
 }
 
-unsigned long long read_msr(int cpu, unsigned int msr_addr) {
-    char path[64];
-    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    unsigned long long val = 0;
-    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
-        if (read(fd, &val, sizeof(val)) != sizeof(val)) val = 0;
-    }
-    close(fd);
-    return val;
-}
-
-bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val) {
-    char path[64];
-    std::snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) return false;
-    bool ok = false;
-    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
-        ok = (write(fd, &val, sizeof(val)) == sizeof(val));
-    }
-    close(fd);
-    return ok;
-}
+// Note: MSR read/write is via msr_platform.h — it provides cross-platform
+// address selection and runtime probing.  This file only exports the
+// availability check.
 
 // ── Throttle/Perf Limit Tables ──
 
@@ -122,7 +111,7 @@ const PerfLimitBits PERF_LIMIT_REASONS_BITS[] = {
 
 // ── RAPL domain scanning ──
 
-void scan_rapl_domains(const std::string& base_path, std::vector<RaplReading>& domains) {
+void scan_rapl_domains(const std::string& base_path, std::vector<RaplDomain>& domains) {
     DIR* dir = opendir(base_path.c_str());
     if (!dir) return;
     struct dirent* entry;
@@ -136,9 +125,10 @@ void scan_rapl_domains(const std::string& base_path, std::vector<RaplReading>& d
         std::string rname = sysfs_read_file(full + "/name");
         if (rname.empty()) continue;
 
-        RaplReading d;
+        RaplDomain d;
+        d.path = full;
         d.name = rname;
-        d.base_path = full;
+        d.valid = true;
         sysfs_read_attr(full, "power_uw", d.power_uw);
         sysfs_read_attr(full, "energy_uj", d.energy_uj);
         sysfs_read_attr(full, "constraint_0_power_limit_uw", d.pl1_uw);
@@ -157,9 +147,81 @@ void scan_rapl_domains(const std::string& base_path, std::vector<RaplReading>& d
     closedir(dir);
 }
 
-std::vector<RaplReading> read_all_rapl_domains() {
-    std::vector<RaplReading> domains;
-    scan_rapl_domains("/sys/class/powercap/intel-rapl", domains);
-    scan_rapl_domains("/sys/class/powercap/intel-rapl-mmio", domains);
+std::vector<RaplDomain> read_all_rapl_domains() {
+    std::vector<RaplDomain> domains;
+    scan_rapl_domains(std::string(SYSFS_RAPL), domains);
+    scan_rapl_domains(std::string(SYSFS_RAPL_MMIO), domains);
     return domains;
+}
+
+// ── Temperature discovery ──
+
+int find_temperature(const std::string& sensor_type) {
+    // Check hwmon first (for i915, amdgpu, xe, nvme)
+    DIR* hwmon_dir = opendir(SYSFS_HWMON);
+    if (hwmon_dir) {
+        struct dirent* entry;
+        while ((entry = readdir(hwmon_dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name[0] == '.') continue;
+            std::string hname = sysfs_read_file(std::string(SYSFS_HWMON) + "/" + name + "/name");
+            if (hname.find(sensor_type) != std::string::npos) {
+                int t = 0;
+                if (sysfs_read_attr(std::string(SYSFS_HWMON) + "/" + name, "temp1_input", t)) {
+                    closedir(hwmon_dir);
+                    return t >= 0 ? t / 1000 : -1;
+                }
+            }
+        }
+        closedir(hwmon_dir);
+    }
+
+    // Check thermal zones
+    DIR* thermal_dir = opendir(SYSFS_THERMAL);
+    if (!thermal_dir) return -1;
+    int max_temp = -1;
+    struct dirent* entry;
+    while ((entry = readdir(thermal_dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name[0] == '.') continue;
+        std::string type = sysfs_read_file(std::string(SYSFS_THERMAL) + "/" + name + "/type");
+        if (type == sensor_type) {
+            int t = 0;
+            if (sysfs_read_attr(std::string(SYSFS_THERMAL) + "/" + name, "temp", t)) {
+                int celsius = t >= 0 ? t / 1000 : -1;
+                if (celsius > max_temp) max_temp = celsius;
+            }
+        }
+    }
+    closedir(thermal_dir);
+    return max_temp;
+}
+
+int read_cpu_pkg_temp() {
+    // Try x86_pkg_temp first (most accurate for CPU package).
+    // Fallback to SOC DTS or CPU thermal zones if x86_pkg_temp is not available.
+    // On Meteor Lake, multiple thermal zones may exist; we take the highest temp.
+    int max_temp = -1;
+    static const char* CPU_TYPES[] = {"x86_pkg_temp", "SOC DTS", "CPU", nullptr};
+    for (int i = 0; CPU_TYPES[i]; ++i) {
+        int t = find_temperature(CPU_TYPES[i]);
+        if (t > max_temp) max_temp = t;
+    }
+    return max_temp;
+}
+
+int read_gpu_temp() {
+    // Try hwmon first — works for i915, amdgpu, and Xe dGPU.
+    static const char* GPU_NAMES[] = {"i915", "amdgpu", "xe", nullptr};
+    for (int i = 0; GPU_NAMES[i]; ++i) {
+        int t = find_temperature(GPU_NAMES[i]);
+        if (t >= 0) return t;
+    }
+
+    // Fallback: use CPU package temp (best available for integrated GPUs).
+    return read_cpu_pkg_temp();
+}
+
+int read_nvme_temp() {
+    return find_temperature("nvme");
 }

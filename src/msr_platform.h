@@ -89,18 +89,22 @@ extern const PlatformMSRs msr_lunar_lake;
 // Detection
 // ═══════════════════════════════════════════════════════════
 
+// Detection result — replaces syslog calls so each binary can log
+// appropriately (syslog for daemon, cout for monitor).
+struct PlatformDetectResult {
+    PlatformMSRs msrs;
+    bool ok = false;
+    std::string message;  // human-readable summary (e.g. "Meteor Lake cpu_plr=0x64F")
+};
+
 // Detect CPU family/model and return the matching MSR table.
 // Called once at startup.  Falls back to probing if the model
 // is not in the table.
-PlatformMSRs detect_platform_msrs();
+PlatformDetectResult detect_platform_msrs();
 
 // Probe a single MSR to see if it is readable.
 // Returns the value read, or (unsigned long long)-1 on failure.
 unsigned long long probe_msr_read(uint32_t msr_addr);
-
-// Probe a single MSR to see if it is writable.
-// Returns true if the write succeeds (reads, compares, restores).
-bool probe_msr_write(uint32_t msr_addr);
 
 // Write a specific value to an MSR. Returns true on success.
 bool probe_msr_write_with_value(uint32_t msr_addr, unsigned long long val);

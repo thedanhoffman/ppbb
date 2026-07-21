@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <sstream>
 #include <string>
-#include <syslog.h>
 
 // ═══════════════════════════════════════════════════════════
 // CPU model ID definitions (from kernel intel-family.h)
@@ -165,33 +164,6 @@ unsigned long long probe_msr_read(uint32_t msr_addr) {
     return ok ? val : (unsigned long long)-1;
 }
 
-bool probe_msr_write(uint32_t msr_addr) {
-    unsigned long long val = probe_msr_read(msr_addr);
-    if (val == (unsigned long long)-1) return false;
-
-    // Try writing 0 (clear all) and restore
-    std::string path = "/dev/cpu/0/msr";
-    int fd = open(path.c_str(), O_WRONLY);
-    if (fd < 0) return false;
-
-    bool ok = false;
-    if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
-        // Write 0 to clear sticky/log bits
-        if (write(fd, &val, sizeof(val)) == sizeof(val))
-            ok = true;
-        // Restore original value
-        if (ok) {
-            unsigned long long restore = val;
-            if (lseek(fd, msr_addr, SEEK_SET) == (off_t)msr_addr) {
-                if (write(fd, &restore, sizeof(restore)) != sizeof(restore))
-                    ok = false;
-            }
-        }
-    }
-    close(fd);
-    return ok;
-}
-
 bool probe_msr_write_with_value(uint32_t msr_addr, unsigned long long val) {
     std::string path = "/dev/cpu/0/msr";
     int fd = open(path.c_str(), O_WRONLY);
@@ -275,7 +247,8 @@ PlatformMSRs validate_msrs(const PlatformMSRs& candidate) {
 // Platform detection
 // ═══════════════════════════════════════════════════════════
 
-PlatformMSRs detect_platform_msrs() {
+PlatformDetectResult detect_platform_msrs() {
+    PlatformDetectResult res;
     CpuIdResult cpu = cpuid(1);
     uint32_t eax = cpu.eax;
 
@@ -290,10 +263,12 @@ PlatformMSRs detect_platform_msrs() {
     const char* gen_name = "unknown";
 
     if (family != FAM) {
-        // Non-family-6 — use safe defaults
-        syslog(LOG_WARNING, "MSR: non-family-6 CPU (family=%u model=%u) — using safe defaults", family, model);
-        // Return empty — caller should handle
-        return PlatformMSRs{};
+        // Non-family-6 — return empty with descriptive message
+        res.ok = false;
+        res.message = "non-family-6 CPU (family=" + std::to_string(family) +
+                      " model=" + std::to_string(model) +
+                      ") — using safe defaults";
+        return res;
     }
 
     if (is_meteor_lake_family(model) || is_lunar_lake_family(model)) {
@@ -312,14 +287,13 @@ PlatformMSRs detect_platform_msrs() {
     }
 
     PlatformMSRs result = validate_msrs(*table);
+    res.ok = (result.cpu_perf_limit != 0);
+    res.msrs = result;
+    res.message = std::string(gen_name) + " family=" + std::to_string(family) +
+                  " model=" + std::to_string(model) + " (0x" +
+                  std::to_string(model) + ") " + msrs_to_string(result);
 
-    syslog(LOG_INFO, "MSR platform: family=%u model=%u (0x%02X) (%s) cpu_plr=0x%03X gpu_plr=0x%03X ring_plr=0x%03X "
-           "bd_prochot=0x%03X rapl=0x%03X pkg_therm=0x%03X",
-           family, model, model, gen_name,
-           result.cpu_perf_limit, result.gpu_perf_limit, result.ring_perf_limit,
-           result.bd_prochot, result.rapl_pkg_limit, result.pkg_thermal_status);
-
-    return result;
+    return res;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -347,7 +321,8 @@ static bool g_msrs_initialized = false;
 
 void init_platform_msrs() {
     if (!g_msrs_initialized) {
-        g_platform_msrs = detect_platform_msrs();
+        auto result = detect_platform_msrs();
+        g_platform_msrs = result.msrs;
         g_msrs_initialized = true;
     }
 }

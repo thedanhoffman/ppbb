@@ -452,6 +452,7 @@ double compute_thermal_headroom(double temp_c) {
 // Legacy weight computation — maps to the new solver's behavior
 void compute_weights(const OptimizerInputs& inputs,
                      double& w_thermal, double& w_throttle, double& w_perf) {
+    const auto& cfg = (inputs.config) ? *inputs.config : default_config;
     w_thermal = 1.0;
     w_throttle = 0.0;
     w_perf = 10.0;
@@ -477,7 +478,7 @@ void compute_weights(const OptimizerInputs& inputs,
         w_perf = std::min(w_perf, 5.0);
     }
 
-    if (!inputs.gpu_throttling && inputs.gpu_w > 15.0) {
+    if (!inputs.gpu_throttling && inputs.gpu_w > cfg.heavy_gpu_w_threshold) {
         w_throttle = std::max(w_throttle, 3.0);
         w_perf = std::min(w_perf, 5.0);
     }
