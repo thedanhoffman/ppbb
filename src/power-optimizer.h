@@ -110,8 +110,12 @@ struct OptimizerInputs {
     bool   have_coretemp = false; // thermal sensors available
 
     // GPU state
-    double gpu_c0_pct   = 0.0;    // GPU C0 residency fraction [0, 1]
+    double gpu_c0_pct     = 0.0;    // GPU C0 residency fraction [0, 1]
     bool   gpu_throttling = false; // GPU throttle event detected
+
+    // CPU state (measured, not guessed)
+    double cpu_measured_w = 0.0;   // actual measured CPU power from RAPL core domain (W)
+    double cpu_domain_max_w = 0.0; // constraint_0_max_power_uw for core domain (W), 0=unknown
 
     // System topology
     int    total_core_groups = 8; // total physical core groups on system
@@ -161,7 +165,10 @@ struct OptimizerResult {
     double weight_throttle  = 0.0;
     double weight_performance = 0.0;
 
-    // Apply smoothing to max_perf_pct
+    // Smoothing alpha used (stored so smooth_max_perf uses the same value)
+    double smooth_alpha = 0.5;
+
+    // Apply smoothing to max_perf_pct (uses stored smooth_alpha)
     int smooth_max_perf(int prev) const;
 
     static int smooth_max_perf_static(int raw, int prev, double alpha);

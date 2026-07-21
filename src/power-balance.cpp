@@ -9,6 +9,7 @@
 
 #include "power-optimizer.h"
 #include "power-utils.h"
+#include "msr_platform.h"
 #include <algorithm>
 #include <chrono>
 #include <csignal>
@@ -68,7 +69,7 @@ struct GpuThrottleCounters {
     bool prev_state[8] = {false};
 };
 
-// CPU perf-limit event tracking (MSR 0x6B0)
+// CPU perf-limit event tracking (MSR 0x690 — MSR_CORE_PERF_LIMIT_REASONS)
 struct PerfLimitCounters {
     int events[16] = {0};
     unsigned int prev_current = 0;
@@ -574,33 +575,17 @@ static void discover_topology(CpuState& c) {
            p, e, c.core_groups.size());
 }
 
-// Target logical CPUs to keep online based on aggression + temperature.
-// Returns the number of CoreGroups to keep online.
-static int compute_keep_groups(int aggression, double temp_c, double /*gpu_w*/) {
-    // idle/cool:  all groups online
-    if (aggression <= 0 && temp_c < 70.0) return 0;  // 0 = all
-
-    // critical:   temp >= 90°C or GPU throttling hard → 1 P-core group (2 threads)
-    if (aggression >= 2 || temp_c >= 90.0) return 1;
-
-    // throttle:   temp 85-90°C or throttling → 3 P + 1 E = 4 groups (7 threads)
-    if (temp_c >= 85.0) return 4;
-
-    // heavy:      temp 80-85°C or GPU active (via residency or agg level)
-    //             → 6 P + 2 E = 8 groups (14 threads)
-    if (aggression >= 1 || temp_c >= 80.0) return 8;
-
-    // moderate:   temp 70-80°C or GPU active → 6 P + 6 E = 12 groups (18 threads)
-    return 12;
-}
-
-static void apply_hotplug(CpuState& c, int aggression, double temp_c, double gpu_w) {
+// Apply hotplug from optimizer result.
+// Issue #4 fix: uses result.keep_groups from solve() instead of standalone
+// compute_keep_groups(). The optimizer's power-ratio-based approach is the
+// single canonical source for hotplug decisions.
+static void apply_hotplug(CpuState& c, int keep_groups_target_from_optimizer) {
     if (c.core_groups.empty()) return;
 
     if (c.hotplug_settle > 0) { c.hotplug_settle--; return; }
 
     int total = (int)c.core_groups.size();
-    int target = compute_keep_groups(aggression, temp_c, gpu_w);
+    int target = keep_groups_target_from_optimizer;
     if (target == 0) target = total;  // 0 means "all"
     target = std::max(target, 1);
     if (target == c.keep_groups_target) return;
@@ -677,7 +662,7 @@ static void save_cpu_state(SystemState& s) {
     if (!s.gpu.gt0.empty()) sysfs_read_attr(s.gpu.gt0 + "/freq0", "max_freq", s.gpu.saved_max_freq_gt0);
     if (!s.gpu.gt1.empty()) sysfs_read_attr(s.gpu.gt1 + "/freq0", "max_freq", s.gpu.saved_max_freq_gt1);
     if (!s.gpu.gt1.empty()) sysfs_read_attr(s.gpu.gt1 + "/freq0", "min_freq", s.gpu.min_freq_gt1);
-    s.saved.msr_1fc = msr_available() ? read_msr(0, 0x1FC) : 0;
+    s.saved.msr_1fc = msr_available() ? probe_msr_read(get_platform_msrs().bd_prochot) : 0;
     syslog(LOG_INFO, "saved state: max_perf=%d  min_perf=%d  no_turbo=%d  epp=%s",
            s.saved.max_perf, s.saved.min_perf, s.saved.no_turbo, s.saved.epp.c_str());
 }
@@ -692,12 +677,13 @@ static void restore_cpu_state(const SystemState& s) {
     if (!s.gpu.saved_profile_gt1.empty()) sysfs_write_str(s.gpu.gt1 + "/freq0/power_profile", s.gpu.saved_profile_gt1);
     if (s.gpu.saved_max_freq_gt0 > 0) sysfs_write_int(s.gpu.gt0 + "/freq0/max_freq", s.gpu.saved_max_freq_gt0);
     if (s.gpu.saved_max_freq_gt1 > 0) sysfs_write_int(s.gpu.gt1 + "/freq0/max_freq", s.gpu.saved_max_freq_gt1);
-    if (s.saved.msr_1fc) write_msr(0, 0x1FC, s.saved.msr_1fc);
+    if (s.saved.msr_1fc && get_platform_msrs().bd_prochot)
+        probe_msr_write_with_value(get_platform_msrs().bd_prochot, s.saved.msr_1fc);
     syslog(LOG_INFO, "restored CPU and GPU state");
 }
 
 static void track_perf_limits(PerfLimitCounters& pl, int cpu) {
-    unsigned long long msr = read_msr(cpu, 0x6B0);
+    unsigned long long msr = platform_read_cpu_perf_limit(cpu);
     unsigned int current = msr & 0xFFFF;
     unsigned int newly = current & ~pl.prev_current;
     for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
@@ -812,12 +798,40 @@ static void assess_gpu_state(const GpuState& g, bool have_gpu, bool settle,
     }
 }
 
-// Disable EC PROCHOT# response via MSR 0x1FC bit 0
+// Disable EC PROCHOT# response via MSR_POWER_CTL bit 0 — BD_PROCHOT
+// Uses cross-platform abstraction (always 0x1FC on Intel).
 static void clear_prochot_msr(bool msr_ok) {
     if (!msr_ok) return;
-    unsigned long long msr_1fc = read_msr(0, 0x1FC);
-    if (msr_1fc & 1)
-        write_msr(0, 0x1FC, msr_1fc & ~1ULL);
+    if (!platform_clear_bd_prochot()) {
+        // syslog warning only if persistent failure — EC may not assert PROCHOT
+    }
+}
+
+// Clear Perf Limit Reasons (MSR 0x690) and Package Perf-Limit Log.
+// Resets all sticky/current perf-limit bits so the daemon starts from a clean
+// slate — any pre-existing throttle events from a previous session are erased.
+//
+//   0x690 — MSR_CORE_PERF_LIMIT_REASONS (per-core, current + sticky log)
+//   Written to all logical CPUs at startup to erase stale throttle events.
+static void clear_plr_history(bool msr_ok, const CpuState& c) {
+    if (!msr_ok) return;
+
+    // Clear CPU perf-limit MSR on cpu0 (package-level)
+    bool ok_pkg0 = platform_clear_cpu_perf_limit(0);
+
+    // Clear per-core CPU perf-limit MSR on every online logical CPU
+    int cores_cleared = 0;
+    for (auto& g : c.core_groups) {
+        for (int cpu : g.cpus) {
+            if (platform_clear_cpu_perf_limit(cpu)) cores_cleared++;
+        }
+    }
+
+    if (ok_pkg0)
+        syslog(LOG_INFO, "PLR history cleared (pkg %s, %d cores)",
+               msrs_to_string(get_platform_msrs()).c_str(), cores_cleared);
+    else
+        syslog(LOG_WARNING, "failed to clear PLR history (check permissions)");
 }
 
 // ── Main ──
@@ -904,7 +918,7 @@ int main(int argc, char** argv) {
     double mmio_pl1 = s.pkg_mmio.valid ? read_pl1_w(s.pkg_mmio) : pl1_w;
 
     // Raise hardware PL1 to desired value on both MSR and MMIO domains.
-    // Cap at package PL4 if present — exceeding PL4 triggers MSR 0x6B0 bit 11.
+    // Cap at package PL4 if present — exceeding PL4 triggers MSR 0x690 bit 11.
     {
         double effective_pl1 = pl1_w;
         if (s.pkg.pl4_w > 0) {
@@ -927,17 +941,20 @@ int main(int argc, char** argv) {
 
     // The EC on this laptop asserts PROCHOT# even at low temperatures (44°C / 4W),
     // which conflicts with the daemon's own thermal management.  Disable the
-    // external PROCHOT# response (MSR 0x1FC bit 0), since we handle throttling
-    // ourselves via aggression levels, temperature overlay, and core offlining.
-    // This is a standard Intel MSR — restored on exit.
+    // external PROCHOT# response (MSR_POWER_CTL bit 0 — BD_PROCHOT),
+    // since we handle throttling ourselves via aggression levels, temperature
+    // overlay, and core offlining.  Restored on exit.
     bool msr_ok = msr_available();
     if (msr_ok) {
-        unsigned long long msr_1fc = read_msr(0, 0x1FC);
-        if (msr_1fc & 1) {
-            write_msr(0, 0x1FC, msr_1fc & ~1ULL);
-            syslog(LOG_INFO, "external PROCHOT# response disabled (MSR 0x1FC bit 0)");
+        init_platform_msrs();
+        if (platform_clear_bd_prochot()) {
+            syslog(LOG_INFO, "external PROCHOT# response disabled (MSR_POWER_CTL bit 0)");
         }
     }
+
+    // Clear Perf Limit Reasons so the daemon starts from a clean slate.
+    // Pre-existing throttle events from a previous session or boot are erased.
+    clear_plr_history(msr_ok, s.cpu);
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
@@ -1023,6 +1040,10 @@ int main(int argc, char** argv) {
         opt_inputs.temp_c             = max_temp;
         opt_inputs.gpu_c0_pct         = s.gpu.c0_pct;
         opt_inputs.gpu_throttling     = throttling;
+        // Issue #5: pass measured CPU power instead of a guess
+        opt_inputs.cpu_measured_w     = core_w;
+        // Issue #9: pass RAPL core domain max limit
+        opt_inputs.cpu_domain_max_w   = s.core.valid ? s.core.max_w : 0.0;
 
         opt_inputs.total_core_groups  = (int)s.cpu.core_groups.size();
         opt_inputs.have_coretemp      = !s.thermal.coretemp_dir.empty();
@@ -1049,7 +1070,7 @@ int main(int argc, char** argv) {
         if (s.core.valid) {
             // PL4 is a per-domain peak power clamp. If the core domain has a PL4 limit,
             // the core RAPL budget must not exceed it — otherwise the core hits PL4
-            // and triggers MSR 0x6B0 bit 11 (Package PL4/Peak perf limit reason).
+            // and triggers MSR 0x690 bit 11 (Package PL4/Peak perf limit reason).
             double core_limit = opt.core_limit_r;
             if (s.core.pl4_w > 0)
                 core_limit = std::min(core_limit, s.core.pl4_w);
@@ -1060,7 +1081,7 @@ int main(int argc, char** argv) {
 
         // ── MMIO package PL1 ──
         // Raise MMIO PL1 to match MSR PL1 so it doesn't become a bottleneck.
-        // Cap at package PL4 if present — exceeding PL4 triggers MSR 0x6B0 bit 11.
+        // Cap at package PL4 if present — exceeding PL4 triggers MSR 0x690 bit 11.
         {
             double effective_pl1 = pl1_w;
             if (s.pkg.pl4_w > 0)
@@ -1088,7 +1109,8 @@ int main(int argc, char** argv) {
         cpu_set_epp(s.cpu, epp_to_string(opt.epp_p), epp_to_string(opt.epp_e));
 
         // ── CPU hotplug (core offlining) ──
-        apply_hotplug(s.cpu, aggression, opt.temp_c, smoothed_gpu_w);
+        // Issue #4 fix: use optimizer's keep_groups instead of daemon's own function
+        apply_hotplug(s.cpu, opt.keep_groups);
 
         // ── GT1 frequency cap ──
         // When GPU is active (aggression >= 1), cap GT1 (media engine) max_freq
@@ -1114,7 +1136,7 @@ int main(int argc, char** argv) {
             // Build CPU MSR perf limit summary (currently active reasons)
             std::string cpu_thr;
             if (msr_ok) {
-                unsigned long long msr = read_msr(0, 0x6B0);
+                unsigned long long msr = platform_read_cpu_perf_limit(0);
                 unsigned int current = msr & 0xFFFF;
                 for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
                     if (i == 0) continue;  // PROCHOT handled separately below

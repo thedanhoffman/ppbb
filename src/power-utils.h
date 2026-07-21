@@ -67,7 +67,7 @@ bool write_msr(int cpu, unsigned int msr_addr, unsigned long long val);
 extern const char* XE_THROTTLE_REASONS[];
 extern const char* XE_THROTTLE_FILES[];
 
-// CPU perf limit reasons (MSR 0x6B0/0x690 bit definitions)
+// CPU perf limit reasons (MSR 0x690 — MSR_CORE_PERF_LIMIT_REASONS bit definitions)
 struct PerfLimitReason {
     const char* name;
     unsigned int bit;

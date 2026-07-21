@@ -9,11 +9,11 @@ enable_testing()
 
 find_package(GTest REQUIRED)
 
-add_executable(power-balance src/power-balance.cpp src/power-optimizer.cpp src/power-utils.cpp)
+add_executable(power-balance src/power-balance.cpp src/power-optimizer.cpp src/power-utils.cpp src/msr_platform.cpp)
 target_include_directories(power-balance PRIVATE src)
 target_compile_options(power-balance PRIVATE -Wall -Wextra)
 
-add_executable(power-status src/power-status.cpp src/power-utils.cpp)
+add_executable(power-status src/power-status.cpp src/power-utils.cpp src/msr_platform.cpp)
 target_include_directories(power-status PRIVATE src)
 target_compile_options(power-status PRIVATE -Wall -Wextra)
 

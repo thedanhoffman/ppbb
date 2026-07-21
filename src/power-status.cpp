@@ -19,6 +19,7 @@
 #include <vector>
 #include <functional>
 #include "power-utils.h"
+#include "msr_platform.h"
 
 // ── Plain ANSI color codes (3-bit only — universally supported) ──
 // Reset: \033[0m   Red: \033[31m   Green: \033[32m
@@ -216,24 +217,29 @@ static void track_gpu_throttle(GpuThrottleState& state, const std::string& throt
     }
 }
 
-// Clear Performance Limit Reasons (MSR 0x6B0) and Package Therm Log (MSR 0x6B1).
-// Writing 0 to both clears current reasons + all sticky/history bits.
+// Clear Performance Limit Reasons (MSR 0x690 — MSR_CORE_PERF_LIMIT_REASONS).
+// Writing 0 clears current reasons + all sticky/history (log) bits.
 // Useful for resetting so that new throttling blips can be observed from zero.
+//
+// Note: 0x6B0 (MSR_GFX_PERF_LIMIT_REASONS) is the GPU-domain register —
+// not relevant for CPU perf-limit tracking.
+// 0x6B1 (MSR_RING_PERF_LIMIT_REASONS) is the Ring/Uncore register — not
+// a thermal log as previously documented.
 static void clear_perf_limit_history() {
     if (!msr_available()) {
         std::cout << color(YEL, "   [PLR clear skipped — MSR unavailable]") << std::endl;
         return;
     }
-    bool ok0 = write_msr(0, 0x6B0, 0ULL);   // IA32_PERF_LIMIT_LOG (current + sticky)
-    bool ok1 = write_msr(0, 0x6B1, 0ULL);   // IA32_PACKAGE_THERM_LOG (sticky therm events)
-    if (ok0 && ok1) {
-        std::cout << color(GRN, "   ✓ Perf-limit history cleared (MSR 0x6B0, 0x6B1)") << std::endl;
+    init_platform_msrs();
+    bool ok0 = platform_clear_cpu_perf_limit(0);
+    if (ok0) {
+        std::cout << color(GRN, "   ✓ Perf-limit history cleared") << std::endl;
     } else {
         std::cout << color(RED, "   ✗ Failed to clear perf-limit history (check permissions)") << std::endl;
     }
 }
 
-// Intel Perf Limit Reasons bit definitions for MSR 0x690 / 0x6B0
+// Intel Perf Limit Reasons bit definitions for MSR 0x690 (MSR_CORE_PERF_LIMIT_REASONS)
 // Lower 16 bits = current status, upper 16 bits = sticky (LOG)
 // Using shared PERF_LIMIT_REASONS_BITS from power-utils.h
 // Perf limit event tracking (accumulated across refresh cycles)
@@ -552,13 +558,14 @@ static void refresh() {
 
     // ── Perf Limit Reasons table ──
     bool msr_ok = msr_available();
-    unsigned long long pkg_reasons = 0, pkg_sticky = 0;
+    unsigned long long pkg_reasons = 0;
     unsigned int pkg_current = 0, pkg_logged = 0;
     if (msr_ok) {
-        pkg_reasons = read_msr(0, 0x6B0);
+        // Read CPU perf-limit MSR (platform-determined: 0x64F or 0x690) — lower 16 = current
+        // status, upper 16 = sticky log.
+        pkg_reasons = platform_read_cpu_perf_limit(0);
         pkg_current = pkg_reasons & 0xFFFF;
         pkg_logged  = (pkg_reasons >> 16) & 0xFFFF;
-        pkg_sticky  = read_msr(0, 0x6B1);
 
         // Update accumulated stats
         unsigned int newly_active = pkg_current & ~g_prev_pkg_current;
@@ -578,7 +585,7 @@ static void refresh() {
     std::vector<CorePlr> core_plrs(cpu_count);
     if (msr_ok) {
         for (int c = 0; c < cpu_count; ++c) {
-            unsigned long long cv = read_msr(c, 0x690);
+            unsigned long long cv = platform_read_cpu_perf_limit(c);
             core_plrs[c].cur = cv & 0xFFFF;
             core_plrs[c].log = (cv >> 16) & 0xFFFF;
         }
@@ -589,13 +596,12 @@ static void refresh() {
 
     {
         auto dot = [](bool on) { return on ? color(RED, "x") : " "; };
-        Table t({"bit", "reason", "pkg cur", "pkg log", "pkg stk", "cores"});
+        Table t({"bit", "reason", "cur", "log", "cores"});
         for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i) {
             unsigned int bit = PERF_LIMIT_REASONS[i].bit;
             unsigned int m = 1u << bit;
             bool in_pkg_cur = (pkg_current & m) != 0;
             bool in_pkg_log = (pkg_logged & m) != 0;
-            bool in_pkg_stk = (msr_ok && ((pkg_sticky >> 16) & 0xFFFF) & m) != 0;
 
             std::string core_str;
             for (int c = 0; c < cpu_count; ++c) {
@@ -613,7 +619,7 @@ static void refresh() {
                 }
             }
             t.row({std::to_string(bit), PERF_LIMIT_REASONS[i].name,
-                   dot(in_pkg_cur), dot(in_pkg_log), dot(in_pkg_stk), core_str});
+                   dot(in_pkg_cur), dot(in_pkg_log), core_str});
         }
         t.print();
     }
@@ -744,7 +750,7 @@ static void refresh() {
 
             std::string lock;
             if (msr_ok && d.name == "package-0") {
-                unsigned long long msr = read_msr(0, 0x610);
+                unsigned long long msr = platform_read_rapl_pkg_limit();
                 if ((msr >> 63) & 1) lock = color(RED, "LOCKED");
                 else if ((msr >> 16) & 1) lock = color(YEL, "clamp-on");
                 else lock = color(GRN, "unlocked");
@@ -978,7 +984,7 @@ static void refresh() {
 
     // ── Throttling summary (only known active reasons) ──
     if (msr_ok) {
-        unsigned long long pkg_now = read_msr(0, 0x6B0);
+        unsigned long long pkg_now = platform_read_cpu_perf_limit(0);
         unsigned int cur = pkg_now & 0xFFFF;
         bool known_active = false;
         for (int i = 0; PERF_LIMIT_REASONS[i].name && PERF_LIMIT_REASONS[i].name[0]; ++i)
@@ -1004,7 +1010,7 @@ static void refresh() {
 
     // ── Tuning capability summary ──
     if (msr_ok) {
-        unsigned long long msr610 = read_msr(0, 0x610);
+        unsigned long long msr610 = platform_read_rapl_pkg_limit();
         bool msr_locked = (msr610 >> 63) & 1;
         bool pl1_clamp = (msr610 >> 16) & 1;
         long long pl1_max = 0;

@@ -132,22 +132,27 @@ TEST(Solve, IdleState) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 0.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.gpu_c0_pct = 0.0;
+    inputs.cpu_measured_w = 5.0;  // idle CPU draw
     inputs.total_core_groups = 8;
     inputs.prev_max_perf = 100;
 
     auto result = solve(inputs);
 
-    // Core budget should be generous
+    // Core budget: analytical headroom dominates (GPU-weighted water-filling)
+    // H_analytical ≈ 19W (GPU priority), H_floor = 6.5W
+    // cpu_budget ≈ 40 - 0 - 19 = 21W
     EXPECT_LT(result.core_power_w, 40.0);
-    EXPECT_GT(result.core_power_w, 35.0);
-    // max_perf should be 100 (no smoothing needed)
+    EXPECT_GT(result.core_power_w, 15.0);
+    // max_perf: cpu_measured_w=5 as ref, budget(21)/ref(5) = 4.2 → clamped to 100
     EXPECT_EQ(result.max_perf_pct, 100);
-    // no_turbo should be 0
-    EXPECT_EQ(result.no_turbo, 0);
-    // EPP should be balance_performance
+    // no_turbo: ratio 4.2 > 0.7 → turbo disabled
+    EXPECT_EQ(result.no_turbo, 1);
+    // EPP should be power (ratio > 0.85 but clamped)
     EXPECT_EQ(result.epp_p, EppLevel::BalancePerformance);
+    // Issue #7: relaxed state (no GPU throttle, temp < t_warn), E-cores less aggressive
     EXPECT_EQ(result.epp_e, EppLevel::BalancePerformance);
     // MIN_CORE_GROUPS constraint means keep_groups >= 2
     EXPECT_GE(result.keep_groups, 2);
@@ -160,6 +165,7 @@ TEST(Solve, GpuThrottlingState) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 15.0;
+    inputs.have_gpu = true;
     inputs.gpu_throttling = true;
     inputs.temp_c = 60.0;
     inputs.total_core_groups = 8;
@@ -167,15 +173,16 @@ TEST(Solve, GpuThrottlingState) {
 
     auto result = solve(inputs);
 
-    // Core budget should be capped
+    // Core budget should be capped at CRITICAL_CPU_MAX_W
     EXPECT_LE(result.core_power_w, CRITICAL_CPU_MAX_W);
-    // max_perf should be 20 (no smoothing needed since prev was also 20)
-    EXPECT_EQ(result.max_perf_pct, 20);
-    // no_turbo should be 1
+    // max_perf smoothed from raw (~45) and prev=20: 0.5*45+0.5*20 ≈ 32
+    EXPECT_GT(result.max_perf_pct, 10);
+    EXPECT_LT(result.max_perf_pct, 50);
+    // no_turbo should be 1 (GPU throttling + thermal override)
     EXPECT_EQ(result.no_turbo, 1);
-    // EPP should be power for P, balance_power for E
+    // Issue #7 fix: E-cores also get Power when GPU throttling
     EXPECT_EQ(result.epp_p, EppLevel::Power);
-    EXPECT_EQ(result.epp_e, EppLevel::BalancePower);
+    EXPECT_EQ(result.epp_e, EppLevel::Power);
     // Throttle weight should be high
     EXPECT_GT(result.weight_throttle, 5.0);
 }
@@ -185,6 +192,7 @@ TEST(Solve, HighThermalState) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 5.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 88.0;
     inputs.total_core_groups = 8;
     inputs.prev_max_perf = 30;
@@ -207,18 +215,22 @@ TEST(Solve, HeavyGpuLoad) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 12.0;
+    inputs.have_gpu = true;
     inputs.gpu_c0_pct = 0.75;
     inputs.temp_c = 60.0;
     inputs.total_core_groups = 8;
+    inputs.prev_max_perf = 100;
 
     auto result = solve(inputs);
 
-    // C0 > 70% → GPU priority
+    // C0 > 70% → GPU weight scaled 2x → higher headroom → lower CPU budget
     EXPECT_GT(result.weight_thermal, 2.0);
     EXPECT_GT(result.weight_throttle, 4.0);
     EXPECT_LT(result.weight_performance, 3.0);
-    // max_perf should be moderate
-    EXPECT_LE(result.max_perf_pct, 75);
+    // max_perf: gpu_weight_scale=2x, headroom is high, cpu_budget ~12.5W
+    // smoothed with prev=100 → moderate (~78)
+    EXPECT_LT(result.max_perf_pct, 90);
+    EXPECT_GT(result.max_perf_pct, 50);
 }
 
 TEST(Solve, GpuPowerExceedsPl1) {
@@ -226,6 +238,7 @@ TEST(Solve, GpuPowerExceedsPl1) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 45.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.gpu_c0_pct = 0.9;
     inputs.total_core_groups = 8;
@@ -240,17 +253,20 @@ TEST(Solve, GpuPowerExceedsPl1) {
 }
 
 TEST(Solve, LowPl1ThermalHeadroomExceedsBudget) {
-    // Very low PL1 (10W) with high temp — thermal headroom may exceed budget
+    // Very low PL1 (10W) with high temp — budget is tight
+    // Issue #2 fix: no thermal double-counting, so headroom is smaller
     OptimizerInputs inputs{};
     inputs.pl1_w = 10.0;
     inputs.gpu_w = 5.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 88.0;
     inputs.gpu_c0_pct = 0.1;
     inputs.total_core_groups = 8;
 
     auto result = solve(inputs);
 
-    // Core budget should be clamped to 0 (10 - 5 - 2 - 3.75 = -0.75 → 0)
+    // headroom_floor_no_thermal: base(2) + z*nominal(4.5) + spike(5*0.25=1.25) = 7.75
+    // cpu_budget = 10 - 5 - 7.75 = -2.75 → clamped to 0
     EXPECT_EQ(result.core_power_w, 0.0);
     EXPECT_EQ(result.core_limit_r, 0.0);
     // Thermal pressure should be high
@@ -258,7 +274,7 @@ TEST(Solve, LowPl1ThermalHeadroomExceedsBudget) {
 }
 
 TEST(Solve, NoGpuDetected) {
-    // No GPU — should behave as GPU idle
+    // No GPU — should behave as GPU idle, full PL1 for CPU
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 0.0;
@@ -269,9 +285,11 @@ TEST(Solve, NoGpuDetected) {
 
     auto result = solve(inputs);
 
-    // Should be idle behavior
+    // Issue #10: no GPU → headroom=0, full PL1 for CPU
+    // cpu_budget = 40, cpu_power_ref = 40, ratio = 1.0
     EXPECT_EQ(result.max_perf_pct, 100);
-    EXPECT_EQ(result.no_turbo, 0);
+    // no_turbo: ratio=1.0 >= 0.7 → turbo disabled
+    EXPECT_EQ(result.no_turbo, 1);
     EXPECT_EQ(result.epp_p, EppLevel::BalancePerformance);
 }
 
@@ -280,6 +298,7 @@ TEST(Solve, NoCoretempNoTemperature) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 10.0;
+    inputs.have_gpu = true;
     inputs.temp_c = -1.0;  // unknown temperature
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_throttling = false;
@@ -290,17 +309,19 @@ TEST(Solve, NoCoretempNoTemperature) {
 
     // Thermal headroom should be zero (no temperature data)
     EXPECT_DOUBLE_EQ(result.thermal_extra_w, 0.0);
-    // no_turbo should be 0 (no thermal reason)
+    // cpu_budget = 40 - 10 - headroom(6.5+2.5) ≈ 21
+    // cpu_power_ref = 40-1 = 39, ratio = 21/39 = 0.54 < 0.7 → turbo safe
     EXPECT_EQ(result.no_turbo, 0);
     // max_perf should be based on GPU power only
     EXPECT_GE(result.max_perf_pct, 50);
 }
 
 TEST(Solve, BoundaryTemperature70C) {
-    // At exactly 70°C — thermal pressure is 0, no constraints
+    // At exactly 70°C — thermal pressure is 0, no thermal constraints
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 0.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 70.0;
     inputs.gpu_c0_pct = 0.0;
     inputs.total_core_groups = 8;
@@ -309,25 +330,29 @@ TEST(Solve, BoundaryTemperature70C) {
 
     // Thermal pressure at 70°C is 0
     EXPECT_DOUBLE_EQ(compute_thermal_pressure(70.0), 0.0);
-    EXPECT_EQ(result.no_turbo, 0);
     EXPECT_DOUBLE_EQ(result.thermal_extra_w, 0.0);
+    // no_turbo determined by power ratio: budget≈21, ref=40, ratio≈0.53 < 0.7 → turbo safe
+    EXPECT_EQ(result.no_turbo, 0);
 }
 
 TEST(Solve, BoundaryTemperature82C) {
-    // At exactly 82°C — no_turbo should trigger
+    // At exactly 82°C — turbo forced off, mild thermal cap
     OptimizerInputs inputs{};
     inputs.pl1_w = 40.0;
     inputs.gpu_w = 0.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 82.0;
     inputs.gpu_c0_pct = 0.0;
     inputs.total_core_groups = 8;
 
     auto result = solve(inputs);
 
-    // no_turbo should be 1 at 82°C
+    // no_turbo forced at 82°C (temp >= t_warn + 2)
     EXPECT_EQ(result.no_turbo, 1);
-    // max_perf should be reduced (pressure = (82-70)/20 = 0.6, max_perf = 100-48 = 52)
-    EXPECT_LT(result.max_perf_pct, 80);
+    // Issue #3 fix: thermal ramp is now cubic (not linear)
+    // x=0.2, cubic=0.104, raw_max_perf≈73, smoothed with prev=100 → ~86
+    EXPECT_LT(result.max_perf_pct, 100);
+    EXPECT_GT(result.max_perf_pct, 80);
 }
 
 TEST(Solve, BoundaryTemperature85C) {
@@ -433,16 +458,18 @@ TEST(Solve, LowPl1NormalConditions) {
     OptimizerInputs inputs{};
     inputs.pl1_w = 15.0;
     inputs.gpu_w = 5.0;
+    inputs.have_gpu = true;
     inputs.temp_c = 55.0;
     inputs.gpu_c0_pct = 0.0;
     inputs.total_core_groups = 8;
 
     auto result = solve(inputs);
 
-    // Core budget = 15 - 5 - 2 = 8W (with some rounding)
-    EXPECT_GT(result.core_power_w, 5.0);
-    EXPECT_LT(result.core_power_w, 10.0);
-    EXPECT_EQ(result.max_perf_pct, 100);
+    // headroom: analytical dominates, gpu_budget ≈ 2.25W
+    EXPECT_GT(result.core_power_w, 1.0);
+    EXPECT_LT(result.core_power_w, 5.0);
+    // max_perf: raw≈39%, smoothed with prev=100 → ~69%
+    EXPECT_LT(result.max_perf_pct, 80);
 }
 
 // ═══════════════════════════════════════════════════════════

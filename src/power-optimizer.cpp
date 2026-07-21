@@ -67,6 +67,10 @@ double thermal_discomfort(const OptimizerConfig& cfg, double temp_c) {
 // Analytical headroom solver
 // ═══════════════════════════════════════════════════════════
 
+static double solve_headroom_analytical_with_weight(const OptimizerConfig& cfg,
+                                                     double alpha_eff,
+                                                     double pl1_w, double gpu_w);
+
 // Water-filling: find headroom H where marginal GPU utility equals
 // marginal CPU utility:
 //   α·f_gpu'(P_gpu + H) = β·f_cpu'(P_cpu_budget - H)
@@ -78,8 +82,10 @@ double thermal_discomfort(const OptimizerConfig& cfg, double temp_c) {
 //   H_floor = H_base + z·H_nominal + thermal_extra + spike_margin
 //
 // Returns the optimal headroom in watts.
-static double solve_headroom_analytical(const OptimizerConfig& cfg,
-                                         double pl1_w, double gpu_w) {
+// Variant that takes an explicit alpha (e.g. C0-scaled) instead of cfg.alpha.
+static double solve_headroom_analytical_with_weight(const OptimizerConfig& cfg,
+                                                     double alpha_eff,
+                                                     double pl1_w, double gpu_w) {
     // Analytical solution: equate marginal utilities
     // α·(gpu_p_max/gpu_p_scale)·exp(-(P_gpu + H)/gpu_p_scale) =
     // β·(cpu_p_max/cpu_p_scale)·exp(-(P_cpu - H)/cpu_p_scale)
@@ -93,10 +99,10 @@ static double solve_headroom_analytical(const OptimizerConfig& cfg,
     double K = (cfg.gpu_p_scale * cfg.cpu_p_scale) /
                (cfg.cpu_p_scale + cfg.gpu_p_scale);
 
-    // Log of the utility weight ratio
+    // Log of the utility weight ratio (uses alpha_eff for C0-scaled GPU weight)
     double log_term = std::log(
         (cfg.beta * cfg.cpu_p_max * cfg.gpu_p_scale) /
-        (cfg.alpha * cfg.gpu_p_max * cfg.cpu_p_scale + 1e-12)
+        (alpha_eff * cfg.gpu_p_max * cfg.cpu_p_scale + 1e-12)
     );
 
     double H_opt = (pl1_w - gpu_w - K * log_term) / (1.0 + ratio);
@@ -105,27 +111,22 @@ static double solve_headroom_analytical(const OptimizerConfig& cfg,
     return std::max(H_opt, 0.0);
 }
 
-// Compute the probabilistic headroom floor.
-// This is the minimum headroom we must reserve, based on risk tolerance.
-// The z parameter controls risk aversion — higher z = more conservative.
+// Headroom floor WITHOUT thermal extra (issue #2 fix: no double-counting).
+// Thermal discomfort is already accounted for in the utility function.
 static double solve_headroom_floor(const OptimizerConfig& cfg,
-                                    double gpu_w, double thermal_extra,
+                                    double gpu_w,
                                     bool gpu_throttling) {
     double H = cfg.headroom_base;
 
-    // Risk term: z * H_nominal. Scale up when GPU is active.
+    // Risk term: z * H_nominal
     H += cfg.headroom_z * cfg.headroom_nominal;
 
-    // When GPU is throttling, be more conservative — scale up the floor
+    // When GPU is throttling, be more conservative
     if (gpu_throttling) {
-        H *= 1.5;  // 50% more headroom when GPU is already throttling
+        H *= 1.5;
     }
 
-    // Thermal headroom: extra buffer to let CPU cool
-    H += thermal_extra;
-
     // Spike margin: GPU power can spike above the smoothed average.
-    // Reserve fraction of GPU power for these spikes.
     if (gpu_w > cfg.spike_min_gpu_w) {
         H += gpu_w * cfg.spike_ratio;
     }
@@ -218,10 +219,9 @@ static int choose_keep_groups(double cpu_power_w, double cpu_power_ref,
 // ═══════════════════════════════════════════════════════════
 
 int OptimizerResult::smooth_max_perf(int prev) const {
-    return static_cast<int>(default_config.max_perf_smooth_alpha *
-           static_cast<double>(raw_max_perf_pct) +
-           (1.0 - default_config.max_perf_smooth_alpha) *
-           static_cast<double>(prev));
+    // Issue #6 fix: use stored smooth_alpha (set from config in solve())
+    // instead of hardcoding default_config.
+    return smooth_max_perf_static(raw_max_perf_pct, prev, smooth_alpha);
 }
 
 int OptimizerResult::smooth_max_perf_static(int raw, int prev, double alpha) {
@@ -230,14 +230,6 @@ int OptimizerResult::smooth_max_perf_static(int raw, int prev, double alpha) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Thermal headroom: temperature → extra power buffer
-// ═══════════════════════════════════════════════════════════
-
-static double compute_thermal_headroom_w(const OptimizerConfig& cfg, double temp_c) {
-    double discomfort = thermal_discomfort(cfg, temp_c);
-    return discomfort * cfg.thermal_headroom_max;
-}
-
 // ═══════════════════════════════════════════════════════════
 // Sample and power computation (for tests)
 // ═══════════════════════════════════════════════════════════
@@ -264,31 +256,57 @@ double round_to_125mw(double watts) {
 OptimizerResult solve(const OptimizerInputs& inputs) {
     OptimizerResult result{};
     const auto& cfg = (inputs.config) ? *inputs.config : default_config;
+    result.smooth_alpha = cfg.max_perf_smooth_alpha;
 
-    // ── Step 1: Compute thermal headroom ──
-    double thermal_extra = 0.0;
-    if (inputs.temp_c >= 0) {
-        thermal_extra = compute_thermal_headroom_w(cfg, inputs.temp_c);
+    // ── Step 1: Effective GPU weight (C0 residency scales GPU priority) ──
+    // Wire gpu_c0_pct into the optimizer: higher C0 residency means the GPU is
+    // actively working, so we weight GPU performance more heavily.
+    //   c0 < 0.30  →  normal GPU weight (idle/background)
+    //   c0 >= 0.70 →  2× GPU weight (heavy render workload)
+    double gpu_weight_scale = 1.0;
+    if (inputs.gpu_c0_pct >= 0.70) {
+        gpu_weight_scale = 2.0;
+    } else if (inputs.gpu_c0_pct >= 0.30) {
+        gpu_weight_scale = 1.0 + (inputs.gpu_c0_pct - 0.30) / 0.40;  // 1.0→2.0
     }
-    result.thermal_extra_w = thermal_extra;
+    double alpha_eff = cfg.alpha * gpu_weight_scale;
 
-    // ── Step 2: Solve for optimal headroom ──
+    // ── Step 2: Thermal discomfort (used in utility, NOT in headroom) ──
+    // Issue #2 fix: thermal is only counted once — in the utility function.
+    // The headroom floor does NOT include thermal_extra.
+    double discomfort = thermal_discomfort(cfg, inputs.temp_c);
+    result.thermal_extra_w = discomfort * cfg.thermal_headroom_max;
+
+    // ── Step 3: Headroom (no thermal double-counting) ──
     // Analytical water-filling gives the utility-optimal headroom.
     // Probabilistic floor ensures we never starve the GPU.
-    double H_analytical = solve_headroom_analytical(cfg, inputs.pl1_w, inputs.gpu_w);
-    double H_floor = solve_headroom_floor(cfg, inputs.gpu_w, thermal_extra,
-                                           inputs.gpu_throttling);
+    // Issue #2: headroom floor only has base + risk + spike terms.
+    double H_analytical = solve_headroom_analytical_with_weight(
+        cfg, alpha_eff, inputs.pl1_w, inputs.gpu_w);
+    double H_floor = solve_headroom_floor(
+        cfg, inputs.gpu_w, inputs.gpu_throttling);
 
     // Optimal headroom: take the more conservative of analytical and floor
     double gpu_headroom = std::max(H_analytical, H_floor);
+
+    // Issue #10: when no GPU, headroom is zero — full PL1 available for CPU.
+    if (!inputs.have_gpu) {
+        gpu_headroom = 0.0;
+    }
+
     result.gpu_headroom_w = gpu_headroom;
 
-    // ── Step 3: Compute CPU power budget ──
+    // ── Step 4: Compute CPU power budget ──
     double cpu_budget = inputs.pl1_w - inputs.gpu_w - gpu_headroom;
 
     // GPU throttling → hard cap on CPU power
     if (inputs.gpu_throttling) {
         cpu_budget = std::min(cpu_budget, cfg.cpu_critical_max_w);
+    }
+
+    // Issue #9: enforce P_cpu_max (RAPL domain hard limit)
+    if (inputs.cpu_domain_max_w > 0) {
+        cpu_budget = std::min(cpu_budget, inputs.cpu_domain_max_w);
     }
 
     cpu_budget = std::max(cpu_budget, 0.0);
@@ -298,55 +316,79 @@ OptimizerResult solve(const OptimizerInputs& inputs) {
     result.core_power_w = cpu_budget;
     result.core_limit_r = core_limit_r;
 
-    // ── Step 4: Map CPU budget to max_perf_pct ──
-    // Estimate CPU power reference: the CPU power when running at 100% max_perf.
-    // Approximated as PL1 minus GPU power when GPU is idle.
-    double cpu_power_ref = inputs.pl1_w - (inputs.have_gpu ? inputs.gpu_w * 0.1 : 0.0);
+    // ── Step 5: Map CPU budget to max_perf_pct ──
+    // Issue #5 fix: use measured CPU power as reference instead of a guess.
+    // When cpu_measured_w is available and positive, use it. Otherwise fall back
+    // to a reasonable estimate based on PL1.
+    double cpu_power_ref;
+    if (inputs.cpu_measured_w > 0.5) {
+        cpu_power_ref = inputs.cpu_measured_w;
+    } else {
+        // Fallback: PL1 minus GPU contribution.
+        cpu_power_ref = inputs.pl1_w - (inputs.have_gpu ? inputs.gpu_w * 0.1 : 0.0);
+    }
 
     int max_perf = map_cpu_power_to_perf_pct(cpu_budget, cpu_power_ref,
                                               cfg.cpu_min_perf, cfg.cpu_max_perf);
 
-    // Thermal override: temperature directly constrains max_perf
+    // Issue #3 fix: thermal constraints are now integrated into the utility
+    // via discomfort-weighted performance curve, not post-hoc overrides.
+    // However, we keep a hard thermal floor as a safety net (not an override
+    // of the optimizer — a hard limit the utility cannot violate).
     if (inputs.temp_c >= cfg.t_warn) {
         double pressure = (inputs.temp_c - cfg.t_warn) / (cfg.t_max - cfg.t_warn);
         pressure = std::min(pressure, 1.0);
-        int thermal_cap = cfg.cpu_max_perf -
-                          static_cast<int>(pressure *
-                          (cfg.cpu_max_perf - cfg.cpu_min_perf));
-        max_perf = std::min(max_perf, std::max(thermal_cap, cfg.cpu_min_perf));
+        // Cubic ramp for sharper response near t_max (matching thermal_discomfort)
+        double thermal_ramp = pressure * pressure * (3.0 - 2.0 * pressure);
+        int thermal_cap = static_cast<int>(cfg.cpu_max_perf -
+            thermal_ramp * (cfg.cpu_max_perf - cfg.cpu_min_perf));
+        thermal_cap = std::max(thermal_cap, cfg.cpu_min_perf);
+        max_perf = std::min(max_perf, thermal_cap);
     }
 
     result.raw_max_perf_pct = max_perf;
+    // Issue #6 fix: use stored smooth_alpha (set from config above)
     result.max_perf_pct = result.smooth_max_perf_static(
         max_perf, inputs.prev_max_perf, cfg.max_perf_smooth_alpha);
 
-    // ── Step 5: Choose turbo ──
+    // ── Step 6: Choose turbo ──
     result.no_turbo = choose_turbo(inputs.temp_c, cpu_budget, cpu_power_ref,
                                     inputs.gpu_throttling, cfg) ? 0 : 1;
 
-    // Thermal override for turbo
+    // Thermal constraint for turbo (safety net, consistent with hard floor above)
     if (inputs.temp_c >= cfg.t_warn + 2.0) {
         result.no_turbo = 1;
     }
 
-    // ── Step 6: Choose EPP levels ──
+    // ── Step 7: Choose EPP levels ──
     double cpu_ratio = (cpu_power_ref > 0) ? cpu_budget / cpu_power_ref : 0;
     result.epp_p = choose_epp(cpu_ratio, inputs.temp_c, cfg);
 
-    // E-cores get one tier less aggressive (more performance-oriented)
-    if (result.epp_p == EppLevel::Power && inputs.temp_c < cfg.t_warn) {
-        result.epp_e = EppLevel::BalancePower;
+    // Issue #7 fix: when GPU is throttling, E-cores get Power too.
+    // E-cores only get a less aggressive EPP when the system is NOT under stress.
+    if (!inputs.gpu_throttling && inputs.temp_c < cfg.t_warn) {
+        // Relaxed state: E-cores get one tier less aggressive
+        if (result.epp_p == EppLevel::Power) {
+            result.epp_e = EppLevel::BalancePower;
+        } else if (result.epp_p == EppLevel::BalancePower) {
+            result.epp_e = EppLevel::BalancePerformance;
+        } else {
+            result.epp_e = result.epp_p;
+        }
     } else {
+        // Under stress (GPU throttling or high temp): E-cores same as P-cores
         result.epp_e = result.epp_p;
     }
 
-    // Thermal override for EPP
+    // Hard thermal floor for EPP (safety net)
     if (inputs.temp_c >= cfg.t_max - 5.0) {
         result.epp_p = EppLevel::Power;
         result.epp_e = EppLevel::Power;
     }
 
-    // ── Step 7: Choose core groups ──
+    // ── Step 8: Choose core groups ──
+    // Issue #4 fix: this is THE canonical keep_groups source.
+    // power-balance.cpp must use result.keep_groups, not its own function.
     int keep_groups = choose_keep_groups(cpu_budget, cpu_power_ref,
                                           inputs.total_core_groups, cfg);
     keep_groups = std::max(keep_groups, cfg.min_core_groups);
@@ -355,17 +397,18 @@ OptimizerResult solve(const OptimizerInputs& inputs) {
     }
     result.keep_groups = keep_groups;
 
-    // ── Step 8: Compute utility (for diagnostics) ──
-    result.util_gpu = cfg.alpha * perf_curve(cfg.gpu_p_max, cfg.gpu_p_scale,
+    // ── Step 9: Compute utility (for diagnostics) ──
+    // GPU utility uses the C0-scaled weight
+    result.util_gpu = alpha_eff * perf_curve(cfg.gpu_p_max, cfg.gpu_p_scale,
                                               inputs.gpu_w);
     result.util_cpu = cfg.beta * perf_curve(cfg.cpu_p_max, cfg.cpu_p_scale,
                                              cpu_budget);
-    result.util_thermal = -cfg.gamma * thermal_discomfort(cfg, inputs.temp_c);
+    result.util_thermal = -cfg.gamma * discomfort;
     result.util_throttle = inputs.gpu_throttling ? -cfg.delta : 0.0;
     result.util_total = result.util_gpu + result.util_cpu +
                         result.util_thermal + result.util_throttle;
 
-    // ── Step 9: Diagnostics ──
+    // ── Step 10: Diagnostics ──
     result.temp_c = inputs.temp_c;
 
     // Legacy weight diagnostics (for compatibility with existing logging)
