@@ -13,6 +13,7 @@
 #include <sstream>
 #include <vector>
 #include <cstdint>
+#include <chrono>
 
 // ═══════════════════════════════════════════════════════════
 // Shared sysfs path constants (const char* for opendir() compatibility)
@@ -87,7 +88,12 @@ bool msr_available();
 // Throttle/Perf Limit Tables
 // ═══════════════════════════════════════════════════════════
 
-// GPU throttle reasons (Xe driver sysfs: reason_pl1, reason_pl2, etc.)
+// GPU throttle reasons (Xe driver sysfs: gt0/freq0/throttle/reason_pl1, etc.)
+// Index order matches XE_THROTTLE_REASONS: 0=pl1, 1=pl2, 2=pl4, 3=prochot,
+// 4=thermal, 5=ratl, 6=vr_tdc, 7=vr_thermalert.
+// These map to GT0_PERF_LIMIT_REASONS bits in xe_regs.h (0x1381a8):
+//   bit 0=PROCHOT, 1=THERMAL_LIMIT, 8=POWER_LIMIT_4,
+//   10=POWER_LIMIT_1, 11=POWER_LIMIT_2, 5=R ATL, 7=VR_TDC, 6=VR_THERMALERT.
 extern const char* XE_THROTTLE_REASONS[];
 extern const char* XE_THROTTLE_FILES[];
 
@@ -154,3 +160,22 @@ int read_gpu_temp();
 
 // Read NVMe temperature from hwmon.
 int read_nvme_temp();
+
+// ═══════════════════════════════════════════════════════════
+// Energy sampling helpers
+// ═══════════════════════════════════════════════════════════
+
+// Energy sample: energy counter + timestamp for power computation.
+struct Sample {
+    long long energy_uj = -1;
+    std::chrono::steady_clock::time_point time;
+};
+
+// Read energy counter from a RAPL domain sysfs path.
+Sample read_energy(const std::string& dir);
+
+// Compute power in watts from two energy samples.
+double compute_power_w(const Sample& prev, const Sample& cur);
+
+// Round to RAPL granularity (125mW).
+double round_to_125mw(double watts);

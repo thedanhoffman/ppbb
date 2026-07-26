@@ -3,13 +3,15 @@
 // RAPL limits, turbo, EPP) is aggressively constrained to ensure the GPU
 // always has the power headroom it needs.
 //
-// Control logic uses linear constraint optimization (power-optimizer.h) to
-// replace hardcoded thresholds with a principled weight-based scheduler.
-// Compile: g++ -std=c++17 -O2 power-balance.cpp -o power-balance
+// Control logic uses resource-domain.h (generic solver) for power allocation
+// and control decisions. Platform-specific actuation via intel-actuator.h.
+// Compile: cmake -B build && cmake --build build
 
-#include "power-optimizer.h"
 #include "power-utils.h"
 #include "msr_platform.h"
+#include "scheduler-stats.h"
+#include "resource-domain.h"   // generic solver: ResourceResult, EppLevel
+#include "intel-actuator.h"    // Intel platform actuator
 #include <algorithm>
 #include <chrono>
 #include <csignal>
@@ -30,12 +32,12 @@
 
 // ── Configuration ──
 static constexpr double   DEFAULT_PL1_W        = 40.0;
-static constexpr int      INTERVAL_MS          = 500;
+static constexpr int      INTERVAL_MS          = 200;
 // GPU activity tracking: C0 residency (c0_pct 0.0–1.0) over 500ms window
-// Drives weight schedule in power-optimizer: idle/active/heavy/throttling.
+// Drives solver weight scaling: idle/active/heavy/throttling.
 //
 // GT1 power minimization (TODO #3 done):
-//   GT0 (graphics) locked in power_saving via set_gt0_profile()
+//   GT0 (graphics) profile switched via set_gt0_profile(): base (active) / power_saving (idle)
 //   GT1 (media) locked in power_saving via set_gt1_profile() — always kept idle
 //   saved_profile_gt1 tracks GT1's original profile for restore on exit
 //
@@ -57,7 +59,7 @@ struct GpuThrottleCounters {
     bool prev_state[8] = {false};
 };
 
-// CPU perf-limit event tracking (MSR 0x690 — MSR_CORE_PERF_LIMIT_REASONS)
+// CPU perf-limit event tracking (MSR: 0x690 Haswell-Skylake, 0x64F Meteor Lake+)
 struct PerfLimitCounters {
     int events[16] = {0};
     unsigned int prev_current = 0;
@@ -88,7 +90,13 @@ struct GpuState {
     long long   last_c0_residency_us = 0; // microseconds, last read value
     long long   _last_c0_time_us = 0;     // steady_clock time of last read (internal)
     double      c0_pct = 0.0;              // 0.0–1.0, residency fraction over measurement window
+    bool        gt0_profile_active = false; // true when base profile is set
+    int         gt0_debounce = 0;           // cycles stable before switching profile
 };
+// Debounce: GT0 power_profile switches only after this many consecutive
+// cycles (× 200ms) showing the same active/idle state.  Prevents rapid
+// toggling when GPU flickers between c6 and active.
+static constexpr int GT0_PROFILE_DEBOUNCE_CYCLES = 10;  // 2 s
 
 // ── GT1 frequency cap ──
 // When the GPU is actively being used, cap GT1 (media engine) max_freq to
@@ -184,6 +192,15 @@ static void rapl_set_power_limit(const RaplDomain& d, double watts_w, long long 
     if (!d.valid) return;
     sysfs_write_int(d.path + "/constraint_0_power_limit_uw", (long long)(watts_w * 1e6));
     sysfs_write_int(d.path + "/constraint_0_time_window_us", time_us);
+}
+
+// Like rapl_set_power_limit() but only writes the power limit when the value changes.
+// The time window is written once at init (constant PP0_TIME_WINDOW_US = 500 us).
+// This avoids flooding the kernel with RAPL driver log messages every 500 ms cycle.
+static void rapl_set_power_limit_if_changed(const RaplDomain& d, double watts_w) {
+    if (!d.valid) return;
+    long long target_uw = (long long)(watts_w * 1e6);
+    sysfs_write_int_if_changed(d.path + "/constraint_0_power_limit_uw", target_uw);
 }
 
 static void rapl_set_enabled(const RaplDomain& d, bool on) {
@@ -341,15 +358,37 @@ static int gpu_get_throttle_state(const GpuState& g, GpuThrottleCounters* counte
     return any;
 }
 
-// Apply profile to GT0 (graphics engine).
-// Apply power_saving profile to GT0 to reduce PL4 events.
-static void set_gt0_profile(const GpuState& g, const std::string& profile) {
+// Switch GT0 (graphics engine) power profile based on GPU activity.
+// Active → "base" (full performance), Idle → "power_saving".
+// Debounced: requires GT0_PROFILE_DEBOUNCE_CYCLES consecutive cycles in the
+// same state before switching, preventing rapid toggling.
+static void set_gt0_profile(GpuState& g, bool gpu_active) {
     if (g.gt0.empty()) return;
+
+    bool want_active = gpu_active;
+    if (want_active == g.gt0_profile_active) {
+        g.gt0_debounce = 0;  // state matches, reset counter
+        return;
+    }
+    g.gt0_debounce++;
+    if (g.gt0_debounce < GT0_PROFILE_DEBOUNCE_CYCLES) return;
+
+    // Switch after N consecutive cycles in the new state
+    const char* target = want_active ? "base" : "power_saving";
     std::string path = g.gt0 + "/freq0/power_profile";
     std::string cur = sysfs_read_file(path);
-    if (cur.empty()) return;
-    if (cur.find(profile) == std::string::npos || cur.find("[" + profile + "]") == std::string::npos)
-        sysfs_write_str(path, profile);
+    if (!cur.empty()) {
+        std::string target_bracket = "[" + std::string(target) + "]";
+        bool already_set = (cur.find(target) != std::string::npos &&
+                            cur.find(target_bracket) != std::string::npos);
+        if (!already_set) {
+            sysfs_write_str(path, target);
+            syslog(LOG_INFO, "GT0 power_profile -> %s (gpu %s, %d cycles)",
+                    target, want_active ? "active" : "idle", g.gt0_debounce);
+        }
+    }
+    g.gt0_profile_active = want_active;
+    g.gt0_debounce = 0;
 }
 
 // Apply profile to GT1 (media engine) — only when explicitly requested.
@@ -533,23 +572,29 @@ static void apply_hotplug(CpuState& c, int keep_groups_target_from_optimizer) {
     int current = count_online_groups(c);
 
     // Build a "should_online" mask for each group:
-    // 1. Start by marking the last `target` groups (lowest priority / most worth keeping)
-    // 2. CPU0 group always online — mark it before any P-core minimum check
-    // 3. Ensure at least 2 P-core groups remain (CPU0 counts toward this)
+    // Groups are sorted by priority descending.  P-cores have higher priority.
+    // CPU0's group is always online (safety floor).  Remaining slots filled
+    // from highest-priority groups (P-cores first, then E-cores if target is large).
     std::vector<bool> should_online(total, false);
-    for (int i = total - target; i < total; ++i) should_online[i] = true;
 
+    // 1. CPU0's group always online
     for (int i = 0; i < total; ++i)
         for (int cp : c.core_groups[i].cpus)
             if (cp == 0) { should_online[i] = true; break; }
 
-    // Ensure at least 2 P-core groups including CPU0
+    // 2. Fill remaining slots from highest-priority groups
+    { int remaining = target - 1;  // -1 for CPU0's group
+      for (int i = 0; i < total && remaining > 0; ++i) {
+          if (!should_online[i]) { should_online[i] = true; remaining--; }
+      } }
+
+    // 3. Ensure at least 1 P-core group stays online (safety floor)
     for (int i = 0; i < total; ++i) {
         if (!should_online[i] && c.core_groups[i].is_pcore) {
             int p_would_stay = 0;
             for (int j = 0; j < total; ++j)
                 if (should_online[j] && c.core_groups[j].is_pcore) p_would_stay++;
-            if (p_would_stay < MIN_CORE_GROUPS) should_online[i] = true;
+            if (p_would_stay < default_resource_config.min_core_groups) should_online[i] = true;
         }
     }
 
@@ -577,7 +622,7 @@ static void apply_hotplug(CpuState& c, int keep_groups_target_from_optimizer) {
         syslog(LOG_INFO, "hotplug: %d groups online (target=%d, keep=%d)",
                new_count, target, current);
         c.keep_groups_target = target;
-        c.hotplug_settle = 20;
+        c.hotplug_settle = 6;  // 1.2s cooldown (6 * 200ms) after hotplug transition
     }
 }
 
@@ -689,8 +734,8 @@ static void discover_thermal(ThermalState& t) {
     closedir(therm);
 }
 
-// Read max core temperature — uses shared function from power-utils.
-// Falls back to coretemp hwmon for per-core granularity.
+// Read maximum temperature from coretemp hwmon (per-core granularity).
+// Falls back to shared find_temperature() for thermal zone scanning.
 static double read_max_core_temp(const ThermalState& t) {
     // Try coretemp hwmon first (per-core granularity)
     if (!t.coretemp_dir.empty()) {
@@ -718,13 +763,6 @@ static double read_max_core_temp(const ThermalState& t) {
 }
 
 // ── Sampling ──
-static Sample read_energy(const std::string& dir) {
-    Sample s;
-    sysfs_read_attr(dir, "energy_uj", s.energy_uj);
-    s.time = std::chrono::steady_clock::now();
-    return s;
-}
-
 static double read_pl1_w(const RaplDomain& d) {
     long long uw = 0;
     sysfs_read_attr(d.path, "constraint_0_power_limit_uw", uw);
@@ -769,23 +807,14 @@ static void assess_gpu_state(const GpuState& g, bool have_gpu, bool settle,
     }
 }
 
-// Disable EC PROCHOT# response via MSR_POWER_CTL bit 0 — BD_PROCHOT
-// Uses cross-platform abstraction (always 0x1FC on Intel).
-static void clear_prochot_msr(bool msr_ok) {
-    if (!msr_ok) return;
-    if (!platform_clear_bd_prochot()) {
-        // syslog warning only if persistent failure — EC may not assert PROCHOT
-    }
-}
-
 // Clear Perf Limit Reasons (MSR 0x690) and Package Perf-Limit Log.
 // Resets all sticky/current perf-limit bits so the daemon starts from a clean
 // slate — any pre-existing throttle events from a previous session are erased.
 //
-//   0x690 — MSR_CORE_PERF_LIMIT_REASONS (per-core, current + sticky log)
+//   MSR_CORE_PERF_LIMIT_REASONS / MSR_PERF_LIMIT_REASONS (per-core, current + sticky log)
 //   Written to all logical CPUs at startup to erase stale throttle events.
-static void clear_plr_history(bool msr_ok, const CpuState& c) {
-    if (!msr_ok) return;
+static void clear_plr_history(const CpuState& c) {
+    if (!platform_ok()) return;
 
     // Clear CPU perf-limit MSR on cpu0 (package-level)
     bool ok_pkg0 = platform_clear_cpu_perf_limit(0);
@@ -809,12 +838,269 @@ static void clear_plr_history(bool msr_ok, const CpuState& c) {
 
 int main(int argc, char** argv) {
     double pl1_w = DEFAULT_PL1_W;
+    bool verbose = false;
+    bool probe_mode = false;
 
     for (int i = 1; i < argc; ++i) {
         if (i + 1 < argc && strcmp(argv[i], "--pl1") == 0) {
             pl1_w = std::stod(argv[++i]);
             if (pl1_w < 1) pl1_w = DEFAULT_PL1_W;
+            ++i;
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
+        } else if (strcmp(argv[i], "--probe") == 0) {
+            probe_mode = true;
         }
+    }
+
+    // ── Probe mode: print hardware info without modifying anything ──
+    if (probe_mode) {
+        SystemState s;
+        discover_rapl(s);
+        discover_gpu(s);
+        discover_thermal(s.thermal);
+        discover_clusters(s.cpu);
+        discover_topology(s.cpu);
+
+        bool have_gpu = !s.gpu.gt0.empty();
+
+        // ── Header ──
+        printf("power-balance --probe\n");
+        printf("====================\n");
+        printf("NOTE: run with daemon stopped for accurate topology.\n");
+        printf("      (sudo systemctl stop power-balance)\n\n");
+
+        // ── CPU model ──
+        auto result = detect_platform_msrs();
+        printf("CPU platform: %s\n", result.message.c_str());
+        if (result.ok) {
+            printf("MSR support: OK (all MSRs readable)\n");
+        } else if (result.message.find("Meteor Lake") != std::string::npos ||
+                   result.message.find("Lunar Lake") != std::string::npos ||
+                   result.message.find("Alder/Raptor Lake") != std::string::npos ||
+                   result.message.find("Haswell-Skylake") != std::string::npos) {
+            // Generation recognized but MSRs not readable — likely permissions
+            printf("MSR support: CPU recognized but MSRs not readable\n");
+            printf("            (run with sudo or as root to probe MSRs)\n");
+        } else {
+            printf("MSR support: FAILED — unsupported CPU\n");
+            printf("\nERROR: CPU is not supported. Cannot proceed.\n");
+            return 1;
+        }
+
+        // ── RAPL domains ──
+        printf("\n--- RAPL domains ---\n");
+        printf("Package (MSR):     %s\n", s.pkg.valid ? s.pkg.path.c_str() : "NOT FOUND");
+        if (s.pkg.valid) {
+            printf("  PL1: %.1fW (max: %.1fW)  PL2: %.1fW  PL4: %.1fW\n",
+                   s.pkg.pl1_w(), s.pkg.max_w(), s.pkg.pl2_w(), s.pkg.pl4_w());
+        }
+        printf("Package (MMIO):    %s\n",
+               s.pkg_mmio.valid ? s.pkg_mmio.path.c_str() : "NOT FOUND");
+        if (s.pkg_mmio.valid) {
+            printf("  PL1: %.1fW (max: %.1fW)  PL2: %.1fW\n",
+                   s.pkg_mmio.pl1_w(), s.pkg_mmio.max_w(), s.pkg_mmio.pl2_w());
+        }
+        printf("Core:              %s\n", s.core.valid ? s.core.path.c_str() : "NOT FOUND");
+        if (s.core.valid) {
+            printf("  PL1: %.1fW (max: %.1fW)  PL4: %.1fW\n",
+                   s.core.pl1_w(), s.core.max_w(), s.core.pl4_w());
+        }
+        printf("Uncore:            %s\n", s.uncore.valid ? s.uncore.path.c_str() : "NOT FOUND");
+        if (s.uncore.valid) {
+            printf("  PL1: %.1fW (max: %.1fW)\n", s.uncore.pl1_w(), s.uncore.max_w());
+        }
+        if (!s.all_rapl_domains.empty()) {
+            printf("Extra domains:    ");
+            for (size_t i = 0; i < s.all_rapl_domains.size(); ++i) {
+                if (i > 0) printf(", ");
+                printf("%s", s.all_rapl_domains[i].name.c_str());
+            }
+            printf("\n");
+        }
+
+        // ── GPU ──
+        printf("\n--- GPU ---\n");
+        if (have_gpu) {
+            printf("GT0 (render):    %s\n", s.gpu.gt0.c_str());
+            printf("GT1 (media):     %s\n",
+                   s.gpu.gt1.empty() ? "NOT FOUND" : s.gpu.gt1.c_str());
+            printf("Idle status:     %s\n",
+                   s.gpu.idle_path.empty() ? "NOT FOUND" : s.gpu.idle_path.c_str());
+            printf("C0 residency:    %s\n",
+                   s.gpu.c0_residency_path.empty() ? "NOT FOUND" : s.gpu.c0_residency_path.c_str());
+
+            // Current GPU state (read-only)
+            std::string gt0_prof = s.gpu.gt0 + "/freq0/power_profile";
+            std::string gt0_prof_val = sysfs_read_file(gt0_prof);
+            printf("GT0 profile:     %s\n", gt0_prof_val.empty() ? "?" : gt0_prof_val.c_str());
+            int gt0_freq = 0;
+            sysfs_read_attr(s.gpu.gt0 + "/freq0", "cur_freq", gt0_freq);
+            printf("GT0 cur_freq:    %d MHz\n", gt0_freq);
+            int gt0_max = 0, gt0_min = 0;
+            sysfs_read_attr(s.gpu.gt0 + "/freq0", "max_freq", gt0_max);
+            sysfs_read_attr(s.gpu.gt0 + "/freq0", "min_freq", gt0_min);
+            printf("GT0 range:       %d-%d MHz\n", gt0_min, gt0_max);
+        } else {
+            printf("GPU: NOT FOUND (CPU-only mode)\n");
+        }
+
+        // ── Thermal ──
+        printf("\n--- Thermal ---\n");
+        printf("coretemp:        %s\n",
+               s.thermal.coretemp_dir.empty() ? "NOT FOUND" : s.thermal.coretemp_dir.c_str());
+        printf("powerclamp:      %s\n",
+               s.thermal.powerclamp_dev.empty() ? "NOT FOUND" : s.thermal.powerclamp_dev.c_str());
+        double max_temp = read_max_core_temp(s.thermal);
+        printf("Current temp:    %.0f°C\n",
+               max_temp >= 0 ? max_temp : -1);
+        printf("pkg_temp (zone): %d°C\n", read_cpu_pkg_temp());
+
+        // ── CPU topology ──
+        printf("\n--- CPU topology ---\n");
+        printf("Total core groups: %d\n", (int)s.cpu.core_groups.size());
+        int pcount = 0, ecount = 0;
+        for (auto& g : s.cpu.core_groups) {
+            if (g.is_pcore) pcount++; else ecount++;
+        }
+        printf("P-core groups:   %d\n", pcount);
+        printf("E-core groups:   %d\n", ecount);
+        printf("\n");
+        printf("  %-4s %-4s %-4s %-20s %-8s %s\n",
+               "Idx", "P?", "HT", "CPUs", "Pri", "Online");
+        for (auto& g : s.cpu.core_groups) {
+            std::string on = sysfs_read_file(
+                "/sys/devices/system/cpu/cpu" + std::to_string(g.cpus[0]) + "/online");
+            std::string cpu_str;
+            for (size_t i = 0; i < g.cpus.size(); ++i) {
+                if (i) cpu_str += ",";
+                cpu_str += std::to_string(g.cpus[i]);
+            }
+            printf("  %-4d %-4s %-4s %-20s %-8d %s\n",
+                   g.id,
+                   g.is_pcore ? "P" : "E",
+                   g.has_ht ? "yes" : "no",
+                   cpu_str.c_str(),
+                   g.priority,
+                   on == "0" ? "offline" : "online");
+        }
+
+        // ── CPU clusters (EPP paths) ──
+        printf("\n--- CPU clusters ---\n");
+        printf("P-core EPP paths: %zu\n", s.cpu.pcore_epp_paths.size());
+        if (!s.cpu.pcore_epp_paths.empty()) {
+            printf("  Example: %s\n", s.cpu.pcore_epp_paths[0].c_str());
+            printf("  Current: %s\n", sysfs_read_file(s.cpu.pcore_epp_paths[0]).c_str());
+        }
+        printf("E-core EPP paths: %zu\n", s.cpu.ecore_epp_paths.size());
+        if (!s.cpu.ecore_epp_paths.empty()) {
+            printf("  Example: %s\n", s.cpu.ecore_epp_paths[0].c_str());
+            printf("  Current: %s\n", sysfs_read_file(s.cpu.ecore_epp_paths[0]).c_str());
+        }
+
+        // ── Current P-state settings ──
+        printf("\n--- Current P-state (intel_pstate) ---\n");
+        int cur_max = 0, cur_min = 0, cur_noturbo = 0;
+        sysfs_read_attr(SYSFS_PSTATE_DIR, "max_perf_pct", cur_max);
+        sysfs_read_attr(SYSFS_PSTATE_DIR, "min_perf_pct", cur_min);
+        sysfs_read_attr(SYSFS_PSTATE_DIR, "no_turbo", cur_noturbo);
+        printf("max_perf_pct:    %d%%\n", cur_max);
+        printf("min_perf_pct:    %d%%\n", cur_min);
+        printf("no_turbo:        %s\n", cur_noturbo ? "ON" : "OFF");
+
+        // ── Current cpufreq settings ──
+        printf("\n--- Current cpufreq ---\n");
+        int global_max = 0, global_min = 0;
+        sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "cpuinfo_max_freq", global_max);
+        sysfs_read_attr("/sys/devices/system/cpu/cpu0/cpufreq", "cpuinfo_min_freq", global_min);
+        printf("CPU0 max_freq:   %d MHz\n", global_max / 1000);
+        printf("CPU0 min_freq:   %d MHz\n", global_min / 1000);
+        // E-core freq range
+        int e_max = 0, e_min = 0;
+        if (!s.cpu.ecore_epp_paths.empty()) {
+            std::string epath = s.cpu.ecore_epp_paths[0];
+            // Derive cpufreq dir from epp path
+            std::string cdir = epath.substr(0, epath.find("/energy_performance_preference"));
+            sysfs_read_attr(cdir, "cpuinfo_max_freq", e_max);
+            sysfs_read_attr(cdir, "cpuinfo_min_freq", e_min);
+            printf("E-core max_freq: %d MHz\n", e_max / 1000);
+            printf("E-core min_freq: %d MHz\n", e_min / 1000);
+        }
+
+        // ── Scheduler demand ──
+        printf("\n--- Scheduler demand ---\n");
+        SchedulerDemand sched = read_scheduler_demand();
+        printf("effective_demand: %.2f\n", sched.effective_demand);
+        printf("pressure some:   avg10=%.2f%% avg60=%.2f%% avg300=%.2f%%\n",
+               sched.pressure_some_avg10, sched.pressure_some_avg60, sched.pressure_some_avg300);
+        printf("pressure full:   avg10=%.2f%% avg60=%.2f%% avg300=%.2f%%\n",
+               sched.pressure_full_avg10, sched.pressure_full_avg60, sched.pressure_full_avg300);
+        printf("load avg:        %.2f / %.2f / %.2f  (runnable: %d / %d)\n",
+               sched.load_avg1, sched.load_avg5, sched.load_avg15,
+               sched.running_tasks, sched.total_tasks);
+        if (sched.cpu_measured) {
+            printf("cpu_active:      %.1f%%  iowait: %.1f%%\n",
+                   sched.cpu_active_pct, sched.cpu_iowait_pct);
+        }
+
+        // ── Service conflicts ──
+        printf("\n--- Service conflicts ---\n");
+        auto service_active = [](const char* name) -> bool {
+            std::string cmd = std::string("systemctl is-active --quiet ") + name;
+            int ret = system(cmd.c_str());
+            return (ret == 0);
+        };
+        printf("power-profiles-daemon: %s\n",
+               service_active("power-profiles-daemon") ? "ACTIVE (CONFLICT!)" : "inactive");
+        printf("thermald:              %s\n",
+               service_active("thermald") ? "ACTIVE (CONFLICT!)" : "inactive");
+        printf("power-balance:         %s\n",
+               service_active("power-balance") ? "ACTIVE (stop for full probe)" : "inactive");
+
+        // ── Solver dry-run ──
+        printf("\n--- Solver dry-run (current conditions) ---\n");
+        ResourceConfig res_cfg;
+        ResourceInputs res_inputs{};
+        res_inputs.pl1_w           = pl1_w;
+        res_inputs.gpu_power_w     = 0;  // snapshot: no measurement yet
+        res_inputs.have_gpu        = have_gpu;
+        res_inputs.temp_c          = max_temp;
+        res_inputs.cpu_demand      = sched.effective_demand;
+        res_inputs.running_tasks   = sched.running_tasks;
+        res_inputs.total_core_groups = (int)s.cpu.core_groups.size();
+        res_inputs.cpu_domain_max_w = s.core.valid ? s.core.max_w() : 0.0;
+
+        ResourceResult res = solve_resources(res_inputs, res_cfg);
+
+        printf("PL1:           %.1fW\n", pl1_w);
+        printf("GPU power:     %.1fW (snapshot)\n", res_inputs.gpu_power_w);
+        printf("Demand:        %.2f\n", sched.effective_demand);
+        printf("Temperature:   %.0f°C\n", max_temp);
+        printf("\nSolver would set:\n");
+        printf("  cpu_target:      %.1fW\n", res.cpu_target_w);
+        printf("  core_limit:      %.1fW\n", res.core_limit_w);
+        printf("  gpu_headroom:    %.1fW\n", res.gpu_headroom_w);
+        printf("  max_perf_pct:    %d%%\n", res.max_perf_pct);
+        printf("  no_turbo:        %s\n", res.no_turbo ? "ON" : "OFF");
+        printf("  epp_p:           %s\n", epp_to_string(res.epp_p));
+        printf("  epp_e:           %s\n", epp_to_string(res.epp_e));
+        printf("  keep_groups:     %d (%s)\n",
+               res.keep_groups,
+               res.keep_groups == 0 ? "all online" : "keep this many");
+        printf("  demand_factor:   %.2f\n", res.demand_factor);
+        printf("  aggression:      %d (%s)\n",
+               res.aggression,
+               res.aggression == 0 ? "idle" : (res.aggression == 1 ? "active" : "throttling"));
+
+        printf("\n--- Config ---\n");
+        printf("risk_tolerance:  %.1f\n", res_cfg.risk_tolerance);
+        printf("cpu_min_w:       %.1fW\n", res_cfg.cpu_min_w);
+        printf("cpu_max_w:       %.1fW\n", res_cfg.cpu_max_w);
+        printf("cpu_min_perf:    %d%%\n", res_cfg.cpu_min_perf);
+        printf("min_core_groups: %d\n", res_cfg.min_core_groups);
+
+        printf("\nProbe complete. No modifications were made.\n");
+        return 0;
     }
 
     openlog("power-balance", LOG_PID | LOG_CONS, LOG_DAEMON);
@@ -870,7 +1156,7 @@ int main(int argc, char** argv) {
         if (!s.gpu.gt1.empty())
             syslog(LOG_INFO, "GPU gt1=%s", s.gpu.gt1.c_str());
         // GT0 gets the operational profile; GT1 stays in power_saving (TODO #3)
-        set_gt0_profile(s.gpu, "power_saving");
+        set_gt0_profile(s.gpu, false);  // start idle = power_saving
         set_gt1_profile(s.gpu, "power_saving");
     } else
         syslog(LOG_WARNING, "GPU not found — running in CPU-only mode");
@@ -907,25 +1193,49 @@ int main(int argc, char** argv) {
     rapl_set_enabled(s.pkg, true);
     rapl_enable_all(s.all_rapl_domains);
 
+    // Write time window for core/uncore RAPL domains once (constant PP0_TIME_WINDOW_US = 500 us).
+    // The power limits are written in the main loop using if_changed variants.
+    if (s.core.valid)
+        rapl_set_power_limit(s.core, s.core.pl1_w() > 0 ? s.core.pl1_w() : 0.0);
+    if (s.uncore.valid)
+        rapl_set_power_limit(s.uncore, s.uncore.max_w() > 0 ? s.uncore.max_w() : 0.0);
+
     // Save initial CPU state
     save_cpu_state(s);
 
-    // The EC on this laptop asserts PROCHOT# even at low temperatures (44°C / 4W),
-    // which conflicts with the daemon's own thermal management.  Disable the
-    // external PROCHOT# response (MSR_POWER_CTL bit 0 — BD_PROCHOT),
-    // since we handle throttling ourselves via aggression levels, temperature
-    // overlay, and core offlining.  Restored on exit.
-    bool msr_ok = msr_available();
-    if (msr_ok) {
-        init_platform_msrs();
-        if (platform_clear_bd_prochot()) {
-            syslog(LOG_INFO, "external PROCHOT# response disabled (MSR_POWER_CTL bit 0)");
+    // ── Platform support check (must pass before any MSR access) ──
+    init_platform_msrs();
+    if (!platform_ok()) {
+        // detect_platform_msrs() already set res.message with the unsupported CPU
+        // details. Print the full message and exit.
+        std::string msg = detect_platform_msrs().message;
+        size_t pos = msg.find("\n");
+        if (pos != std::string::npos) {
+            syslog(LOG_ERR, "%s", msg.substr(0, pos).c_str());
+            for (size_t i = pos + 1; i < msg.size(); ) {
+                size_t nl = msg.find('\n', i);
+                if (nl == std::string::npos) nl = msg.size();
+                syslog(LOG_INFO, "%s", msg.substr(i, nl - i).c_str());
+                i = nl + 1;
+            }
+        } else {
+            syslog(LOG_ERR, "%s", msg.c_str());
         }
+        return 1;
+    }
+
+    // The EC on this laptop asserts PROCHOT# even at low temperatures (44°C / 4W),
+    // which conflicts with the daemon's GPU-first power management.  Disable the
+    // external PROCHOT# response (MSR_POWER_CTL bit 0 — BD_PROCHOT),
+    // since we handle throttling ourselves via GPU headroom, EPP, and core offlining.
+    // Restored on exit.
+    if (platform_clear_bd_prochot()) {
+        syslog(LOG_INFO, "external PROCHOT# response disabled (MSR_POWER_CTL bit 0)");
     }
 
     // Clear Perf Limit Reasons so the daemon starts from a clean slate.
     // Pre-existing throttle events from a previous session or boot are erased.
-    clear_plr_history(msr_ok, s.cpu);
+    clear_plr_history(s.cpu);
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
@@ -951,9 +1261,10 @@ int main(int argc, char** argv) {
     GpuThrottleCounters gpu_tc;
     PerfLimitCounters pl_tc;
     int last_aggression = -1;      // 0=idle, 1=active, 2=throttling
-    int prev_max_perf = 100;       // previous max_perf_pct (for smoothing)
+    int prev_max_perf = 100;       // previous max_perf_pct (for smoothing across cycles)
     EppLevel prev_epp_p = EppLevel::BalancePerformance;  // prev EPP (for hysteresis)
     EppLevel prev_epp_e = EppLevel::BalancePerformance;
+    int prev_keep_groups = 0;                             // prev hotplug target (hysteresis)
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(INTERVAL_MS));
@@ -967,7 +1278,7 @@ int main(int argc, char** argv) {
 
         if (pkg_w < 0) continue;
         if (first) { smoothed_gpu_w = gpu_w; first = false; }
-        smoothed_gpu_w = default_config.max_perf_smooth_alpha * gpu_w + (1.0 - default_config.max_perf_smooth_alpha) * smoothed_gpu_w;
+        smoothed_gpu_w = default_resource_config.max_perf_smooth_alpha * gpu_w + (1.0 - default_resource_config.max_perf_smooth_alpha) * smoothed_gpu_w;
 
 
 
@@ -998,57 +1309,73 @@ int main(int argc, char** argv) {
         gpu_read_c0_residency(s.gpu);
 
         // ── Track CPU MSR perf limit reasons ──
-        if (msr_ok) track_perf_limits(pl_tc, 0);
+        if (platform_ok()) track_perf_limits(pl_tc, 0);
 
         // ── Temperature reading ──
         double max_temp = read_max_core_temp(s.thermal);
 
-        // ── Build optimizer inputs ──
-        OptimizerInputs opt_inputs{};
-        opt_inputs.pl1_w              = pl1_w;
-        opt_inputs.gpu_w              = smoothed_gpu_w;
-        opt_inputs.have_gpu           = have_gpu;
-        opt_inputs.temp_c             = max_temp;
-        opt_inputs.gpu_c0_pct         = s.gpu.c0_pct;
-        opt_inputs.gpu_throttling     = throttling;
-        // Issue #5: pass measured CPU power instead of a guess
-        opt_inputs.cpu_measured_w     = core_w;
-        // Issue #9: pass RAPL core domain max limit
-        opt_inputs.cpu_domain_max_w   = s.core.valid ? s.core.max_w() : 0.0;
-
-        opt_inputs.total_core_groups  = (int)s.cpu.core_groups.size();
-        opt_inputs.have_coretemp      = !s.thermal.coretemp_dir.empty();
-        opt_inputs.config             = &default_config;
-        // Pass previous state for smoothing/hysteresis
-        opt_inputs.prev_max_perf      = prev_max_perf;
-        opt_inputs.prev_epp_p         = prev_epp_p;
-        opt_inputs.prev_epp_e         = prev_epp_e;
-
-        // ── Debug: log optimizer inputs and utility for diagnostics ──
-        if (opt_inputs.temp_c >= 0) {
-            syslog(LOG_DEBUG, "OPT-IN: pl1=%.1f gpu=%.1f temp=%.1f c0=%.1f throttle=%d",
-                   opt_inputs.pl1_w, opt_inputs.gpu_w, opt_inputs.temp_c,
-                   opt_inputs.gpu_c0_pct, opt_inputs.gpu_throttling);
-        }
+        // ── Scheduler demand (CPU utilization + pressure from kernel) ──
+        // Tells the optimizer how much the CPU actually needs.  Low demand →
+        // the CPU has excess power headroom; high demand → CPU is saturated.
+        // Read before optimizer inputs so cpu_demand is set.
+        SchedulerDemand sched = read_scheduler_demand();
 
         // ── Solve optimization problem ──
-        OptimizerResult opt = solve(opt_inputs);
-        int aggression = aggression_from_weights(opt.weight_thermal,
-                                                 opt.weight_throttle,
-                                                 opt.weight_performance);
+        ResourceConfig res_cfg;
+        ResourceInputs res_inputs{};
+        res_inputs.pl1_w            = pl1_w;
+        res_inputs.gpu_power_w      = smoothed_gpu_w;
+        res_inputs.have_gpu         = have_gpu;
+        res_inputs.temp_c           = max_temp;
+        res_inputs.cpu_demand       = sched.effective_demand;
+        res_inputs.gpu_c0_pct       = s.gpu.c0_pct;
+        res_inputs.gpu_throttling   = throttling;
+        res_inputs.gpu_power_var_w  = 2.0;  // placeholder: measured variance to be added
+        res_inputs.cpu_measured_w   = core_w;
+        res_inputs.cpu_domain_max_w = s.core.valid ? s.core.max_w() : 0.0;
+        res_inputs.total_core_groups = (int)s.cpu.core_groups.size();
+        res_inputs.running_tasks     = sched.running_tasks;
+        // Pass previous state for smoothing/hysteresis
+        res_inputs.prev_max_perf    = prev_max_perf;
+        res_inputs.prev_epp_p       = prev_epp_p;
+        res_inputs.prev_epp_e       = prev_epp_e;
+        res_inputs.prev_keep_groups = prev_keep_groups;
 
-        // ── Apply RAPL limits (core budget from optimization) ──
+        ResourceResult res = solve_resources(res_inputs, res_cfg);
+
+        // ── Aggression level (for logging) ──
+        int aggression = res.aggression;
+
+        // ── Debug: print solver inputs + output (LOG_DEBUG, only with --verbose) ──
+        if (verbose) {
+            syslog(LOG_DEBUG, "OPT-INPUTS: pl1=%.1fW gpu=%.1fW gpu_sm=%.1fW gpu_c0=%d%% "
+                   "gpu_thr=%d temp=%.1fC cpu_measured=%.1fW core_max=%.1fW demand=%.2f "
+                   "groups=%d running=%d",
+                   pl1_w, smoothed_gpu_w, gpu_w,
+                   (int)(s.gpu.c0_pct * 100.0), throttling, max_temp,
+                   core_w, s.core.valid ? s.core.max_w() : 0.0,
+                   sched.effective_demand, (int)s.cpu.core_groups.size(),
+                   sched.running_tasks);
+            syslog(LOG_DEBUG, "OPT-RESULT: cpu_target=%.1fW effective=%.1fW gpu_headroom=%.1fW "
+                   "demand_factor=%.2f keep_groups=%d "
+                   "core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s epp_e=%s",
+                   res.cpu_target_w, res.effective_cpu_w(), res.gpu_headroom_w,
+                   res.demand_factor, res.keep_groups,
+                   res.core_limit_w, res.max_perf_pct, res.no_turbo,
+                   epp_to_string(res.epp_p), epp_to_string(res.epp_e));
+        }
+
+        // ── Apply RAPL limits (core budget from solver) ──
+        // Use if_changed — only write sysfs when values differ. Time window written once at init.
         if (s.core.valid) {
-            // PL4 is a per-domain peak power clamp. If the core domain has a PL4 limit,
-            // the core RAPL budget must not exceed it — otherwise the core hits PL4
-            // and triggers MSR 0x690 bit 11 (Package PL4/Peak perf limit reason).
-            double core_limit = opt.core_limit_r;
+            double core_limit = res.core_limit_w;
+            // Thermal surrender removed — budget is pure GPU-first allocation.
             if (s.core.pl4_w() > 0)
                 core_limit = std::min(core_limit, s.core.pl4_w());
-            rapl_set_power_limit(s.core, core_limit);
+            rapl_set_power_limit_if_changed(s.core, core_limit);
         }
         if (s.uncore.valid)
-            rapl_set_power_limit(s.uncore, s.uncore.max_w() > 0 ? s.uncore.max_w() : 0.0);
+            rapl_set_power_limit_if_changed(s.uncore, s.uncore.max_w() > 0 ? s.uncore.max_w() : 0.0);
 
         // ── MMIO package PL1 ──
         // Raise MMIO PL1 to match MSR PL1 so it doesn't become a bottleneck.
@@ -1058,36 +1385,49 @@ int main(int argc, char** argv) {
             if (s.pkg.pl4_w() > 0)
                 effective_pl1 = std::min(effective_pl1, s.pkg.pl4_w());
             if (s.pkg_mmio.valid) {
-                long long mmio_now = 0;
-                sysfs_read_attr(s.pkg_mmio.path, "constraint_0_power_limit_uw", mmio_now);
-                long long target = (long long)(effective_pl1 * 1e6);
-                if (mmio_now < target)
-                    rapl_set_power_limit(s.pkg_mmio, effective_pl1);
+                sysfs_write_int_if_changed(s.pkg_mmio.path + "/constraint_0_power_limit_uw",
+                                           (long long)(effective_pl1 * 1e6));
             }
         }
 
-        // ── PROCHOT# response (clear every cycle) ──
-        clear_prochot_msr(msr_ok);
+        // ── PROCHOT# response — already cleared at startup (MSR is persistent) ──
 
-        // ── CPU frequency control (from optimizer) ──
-        if (!sysfs_write_int(SYSFS_PSTATE_MAX, opt.max_perf_pct)) {
-            syslog(LOG_WARNING, "failed to write max_perf_pct=%d", opt.max_perf_pct);
+        // ── CPU frequency control (from solver) ──
+        // Use if_changed — only write pstate sysfs when values differ from what's set.
+        { // max_perf_pct
+            int cur = 0;
+            if (!sysfs_read_attr(SYSFS_PSTATE_DIR, "max_perf_pct", cur) || cur != res.max_perf_pct) {
+                if (!sysfs_write_int(SYSFS_PSTATE_MAX, res.max_perf_pct))
+                    syslog(LOG_WARNING, "failed to write max_perf_pct=%d", res.max_perf_pct);
+            }
         }
-        if (!sysfs_write_int(SYSFS_PSTATE_NOTURBO, opt.no_turbo)) {
-            syslog(LOG_WARNING, "failed to write no_turbo=%d", opt.no_turbo);
+        { // no_turbo
+            int cur = 0;
+            if (!sysfs_read_attr(SYSFS_PSTATE_DIR, "no_turbo", cur) || cur != res.no_turbo) {
+                if (!sysfs_write_int(SYSFS_PSTATE_NOTURBO, res.no_turbo))
+                    syslog(LOG_WARNING, "failed to write no_turbo=%d", res.no_turbo);
+            }
         }
-        int min_perf = (opt.keep_groups > 0 && opt.keep_groups < (int)s.cpu.core_groups.size())
-                       ? 0 : s.saved.min_perf;
-        if (!sysfs_write_int(SYSFS_PSTATE_MIN, min_perf)) {
-            syslog(LOG_WARNING, "failed to write min_perf_pct=%d", min_perf);
+        { // min_perf_pct
+            int min_perf = (res.keep_groups > 0 && res.keep_groups < (int)s.cpu.core_groups.size())
+                           ? 0 : s.saved.min_perf;
+            int cur = 0;
+            if (!sysfs_read_attr(SYSFS_PSTATE_DIR, "min_perf_pct", cur) || cur != min_perf) {
+                if (!sysfs_write_int(SYSFS_PSTATE_MIN, min_perf))
+                    syslog(LOG_WARNING, "failed to write min_perf_pct=%d", min_perf);
+            }
         }
 
-        // ── EPP (from optimizer) ──
-        cpu_set_epp(s.cpu, epp_to_string(opt.epp_p), epp_to_string(opt.epp_e));
+        // ── EPP (from solver) ──
+        cpu_set_epp(s.cpu, epp_to_string(res.epp_p), epp_to_string(res.epp_e));
 
         // ── CPU hotplug (core offlining) ──
-        // Issue #4 fix: use optimizer's keep_groups instead of daemon's own function
-        apply_hotplug(s.cpu, opt.keep_groups);
+        apply_hotplug(s.cpu, res.keep_groups);
+
+        // ── GT0 power profile ──
+        // Active GPU → "base" profile (full performance).
+        // Idle GPU → "power_saving" (minimises idle draw).
+        set_gt0_profile(s.gpu, active);
 
         // ── GT1 frequency cap ──
         // When GPU is active (aggression >= 1), cap GT1 (media engine) max_freq
@@ -1112,7 +1452,7 @@ int main(int argc, char** argv) {
             }
             // Build CPU MSR perf limit summary (currently active reasons)
             std::string cpu_thr;
-            if (msr_ok) {
+            if (platform_ok()) {
                 unsigned long long msr = platform_read_cpu_perf_limit(0);
                 unsigned int current = msr & 0xFFFF;
                 for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {
@@ -1127,26 +1467,33 @@ int main(int argc, char** argv) {
             if (!gpu_thr.empty()) throttle_summary += "  gpu-throttle: " + gpu_thr;
             if (!cpu_thr.empty()) throttle_summary += "  cpu-throttle: " + cpu_thr;
             char temp_buf[32] = "";
-            if (opt.temp_c >= 0)
-                snprintf(temp_buf, sizeof(temp_buf), "  temp=%.0fC", opt.temp_c);
+            if (max_temp >= 0)
+                snprintf(temp_buf, sizeof(temp_buf), "  temp=%.0fC", max_temp);
             // C0 residency percentage (only when path is available)
             char c0_buf[32] = "";
             if (!s.gpu.c0_residency_path.empty())
                 snprintf(c0_buf, sizeof(c0_buf), "  c0=%d%%", (int)(s.gpu.c0_pct * 100.0));
-            std::string epp_str = epp_to_string(opt.epp_p);
-            if (opt.epp_e != opt.epp_p) epp_str += "(" + std::string(epp_to_string(opt.epp_e)) + ")";
+            std::string epp_str = epp_to_string(res.epp_p);
+            if (res.epp_e != res.epp_p) epp_str += "(" + std::string(epp_to_string(res.epp_e)) + ")";
+            // Solver diagnostics
+            char res_buf[64] = "";
+            if (res.demand_factor != 1.0) {
+                snprintf(res_buf, sizeof(res_buf), "  demand=%.2f",
+                         res.demand_factor);
+            }
             syslog(LOG_INFO, "[%s] pkg=%.1fW core=%.1fW gpu=%.1fW(gpu_sm=%.1fW) "
-                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s",
+                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s%s kp_grp=%d",
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
-                   pl1_w, opt.core_limit_r, opt.max_perf_pct, opt.no_turbo, epp_str.c_str(),
-                   temp_buf, throttle_summary.c_str(), c0_buf);
+                   pl1_w, res.core_limit_w, res.max_perf_pct, res.no_turbo, epp_str.c_str(),
+                   temp_buf, res_buf, throttle_summary.c_str(), c0_buf, res.keep_groups);
             last_aggression = aggression;
         }
 
         // ── Save state for next cycle smoothing ──
-        prev_max_perf = opt.max_perf_pct;
-        prev_epp_p = opt.epp_p;
-        prev_epp_e = opt.epp_e;
+        prev_max_perf = res.max_perf_pct;
+        prev_epp_p = res.epp_p;
+        prev_epp_e = res.epp_e;
+        prev_keep_groups = res.keep_groups;
     }
 
     // ── Report final throttle statistics ──
@@ -1163,7 +1510,7 @@ int main(int argc, char** argv) {
     } else if (have_gpu) {
         syslog(LOG_INFO, "GPU hardware throttle events: none");
     }
-    if (msr_ok) {
+    if (platform_ok()) {
         std::string cpu_summary;
         int cpu_total = 0;
         for (int i = 0; PERF_LIMIT_REASONS[i].name; ++i) {

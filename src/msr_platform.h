@@ -34,9 +34,12 @@ struct PlatformMSRs {
     // Lower 16 = current, upper 16 = sticky/log (clearable).
     //   Haswell–Skylake:  0x690
     //   Meteor Lake+:     0x64F
-    // Bit layout: PROCHOT=0, Thermal=1, EDP=2, PL1=3, Platform=4,
-    //             LowUtil=5, VR_Thermal=6, VR_TDC=7, TurboLimit=8,
-    //             ... (see PERF_LIMIT_REASONS table in power-utils.h)
+    // Bit layout (MSR_CORE_PERF_LIMIT_REASONS / MSR_PERF_LIMIT_REASONS):
+    //   0=PROCHOT, 1=Thermal, 2=Current(EDP), 3=Power(PL1),
+    //   4=Platform, 5=Autonomous, 6=VR_Temp, 7=HTC (Hot Threshold Crisis),
+    //   8=Core/Cache, 9=Amps, 10=PROCHOT_Deassert, 11=PL4/Peak,
+    //   12=PkgPwrLatch, 13=Clipping
+    // (see PERF_LIMIT_REASONS table in power-utils.h)
     uint32_t cpu_perf_limit = 0;   // 0 = not available
 
     // ── BD-PROCHOT disable ──
@@ -51,13 +54,15 @@ struct PlatformMSRs {
     uint32_t rapl_pkg_limit = 0x610;
 
     // ── GPU perf-limit reasons (Xe / i915) ──
-    // MSR_GFX_PERF_LIMIT_REASONS — GPU-domain perf-limit reasons.
-    // Different bit layout than CPU (see xe_gt_regs.h).
-    // Read via MMIO in the GPU driver; MSR access is per-core.
+    // MSR_GFX_PERF_LIMIT_REASONS (0x6B0) — GPU-domain perf-limit reasons.
+    // Xe driver also exposes GT0_PERF_LIMIT_REASONS via MMIO at 0x1381a8.
+    // Bit layout differs from CPU MSR (see xe_regs.h).
+    // Read via sysfs (reason_pl1, reason_pl2, etc.) in power-balance;
+    // direct MSR read via this field in power-status.
     uint32_t gpu_perf_limit = 0x6B0;
 
     // ── Ring/Uncore perf-limit reasons ──
-    // MSR_RING_PERF_LIMIT_REASONS — uncore domain perf-limit reasons.
+    // MSR_RING_PERF_LIMIT_REASONS (0x6B1) — uncore domain perf-limit reasons.
     uint32_t ring_perf_limit = 0x6B1;
 
     // ── Package thermal status ──
@@ -98,9 +103,14 @@ struct PlatformDetectResult {
 };
 
 // Detect CPU family/model and return the matching MSR table.
-// Called once at startup.  Falls back to probing if the model
-// is not in the table.
+// Called once at startup.  Rejects any CPU not explicitly supported.
 PlatformDetectResult detect_platform_msrs();
+
+// Check if a supported platform was detected (all MSRs probed successfully).
+// Returns false on unsupported CPU, missing /dev/cpu/0/msr, or failed probe.
+// Callers should exit immediately on false — the daemon cannot operate safely
+// without knowing the perf-limit MSR address.
+bool platform_ok();
 
 // Probe a single MSR to see if it is readable.
 // Returns the value read, or (unsigned long long)-1 on failure.

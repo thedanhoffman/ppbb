@@ -11,86 +11,119 @@ Also includes `power-status` — a terminal power monitor (self-explanatory:
 
 ## How it works
 
-### Aggression levels
+### Utility-maximizing optimizer
 
 Every 500 ms the daemon reads RAPL energy counters for the package, core
 (PP0), and uncore (PP1) domains, computes instantaneous power draw, and
-classifies GPU state as one of three aggression levels:
+feeds observed state into a constrained utility maximization solver:
 
-| Level | Trigger | Effect |
-|-------|---------|--------|
-| **idle** (0) | GPU in RC6, draw below 3 W | Relax all CPU controls: max_perf=100%, no_turbo=0, EPP=`balance_performance` |
-| **active** (1) | GPU out of RC6 or draw above 3 W | Moderate CPU back-off: max_perf scales inversely with GPU power (50% minimum), turbo disabled above 15 W GPU draw, EPP=`balance_power` |
-| **throttle** (2) | Any GPU throttle flag active (excluding PL4) | CRITICAL — hammer the CPU: max_perf=20%, no_turbo=1, EPP=`power`, core RAPL budget capped at 8 W |
+```
+  maximize  U = α·f_gpu(P_gpu) + β·f_cpu(P_cpu) − γ·h(T) − δ·I(throttle)
+  subject to: P_cpu + P_gpu + H ≤ PL1
+```
 
-GPU PL4 (peak current) events are **not** treated as a throttle trigger —
-they are the GPU tile's normal internal peak current management handled
-transparently by the GuC firmware.  PL4 events are still tracked and logged
-but do not escalate aggression.
+**Performance curves** — saturating exponential: `f(P) = P_max·(1 − exp(−P/P_scale))`
+  CPU: `P_max=1.0`, `P_scale=25 W` GPU: `P_max=1.0`, `P_scale=20 W`
+
+**C0 residency scaling** — GPU C0 ≥ 70% doubles the GPU weight (α→2α), giving
+GPU performance higher priority during active workloads.
+
+**Analytical headroom** — the optimal headroom `H` is found by equating marginal
+utilities (water-filling), yielding a closed-form solution:
+```
+  H_opt = (PL1 − P_gpu − K·ln(weight_ratio)) / (1 + cpu_p_scale/gpu_p_scale)
+```
+This is clamped to a **probabilistic floor**: `H_base + z·H_nominal + spike_margin`,
+ensuring the GPU always has reserved power headroom even when the analytical
+solution would allocate too little.
+
+**Discrete control mapping** — continuous optimal power allocations are
+translated into sysfs controls:
+  - `max_perf_pct`: inverse-squared mapping from CPU power budget
+  - `no_turbo`: disabled when GPU is throttling or temp ≥ 82 °C
+  - `EPP`: selected by CPU power utilization ratio (Power/BalancePower/BalancePerformance)
+  - `hotplug`: core groups offlined as CPU power demand drops below threshold
+
+The `aggression` label in log output is derived from computed weights
+(throttle events, GPU activity, CPU demand) and is **for logging only** —
+it does not drive control decisions.
 
 ### RAPL budget allocation
 
-The daemon sets uncore (PP1) budget to **0** (unlimited — GPU gets what it
-needs).  Core (PP0) budget is:
+The daemon sets the uncore (PP1) RAPL power limit to its **max_w** value
+(unlimited within hardware limits), and applies the optimizer's computed
+core budget (PP0):
 
 ```
-core_budget = PL1 − gpu_draw − headroom_margin
+core_budget = (PL1 − gpu_draw − gpu_headroom) × demand_factor
 ```
+
+where `gpu_headroom` is the larger of the analytical water-filling solution
+and the probabilistic floor, and `demand_factor` (0.5–1.0) scales the CPU
+budget downward when scheduler pressure is low (idle CPU has no demand).
+When GPU throttling is detected, `core_budget` is hard-capped at `cpu_critical_max_w`
+(default 8 W).
 
 On Meteor Lake the MMIO RAPL domain (`intel-rapl-mmio`) is also kept in sync
 with the MSR PL1 so it does not become a hidden bottleneck.
 
 ### Package PL1
 
-The daemon raises the package PL1 to a configurable value at startup (default
-40 W).  While the declared `max_power_uw` may be lower (e.g., 28 W), the
-hardware VR accepts higher values.  Raising PL1 gives the GPU tile's voltage
-regulator more peak current headroom, dramatically reducing GPU PL4 (peak
-power) events.
+The daemon sets the package PL1 to a configurable value at startup (default
+40 W; override with `--pl1 <watts>`).  While the declared `constraint_0_max_power_uw`
+from the RAPL hardware may be lower (e.g., 28 W), the hardware VR accepts
+higher values.  Raising PL1 gives the GPU tile's voltage regulator more peak
+current headroom, dramatically reducing GPU PL4 (peak power) events.  If the
+specified PL1 exceeds the hardware's PL4 limit, the daemon clamps PL1 down to
+the PL4 value and warns via syslog.
 
-### Temperature-aware overlay
+### Temperature monitoring (read-only)
 
 The daemon independently reads the hottest core temperature from `coretemp`
-and applies a second set of constraints that override the aggression-based
-values when the CPU is hot.  The most conservative value always wins.
+and logs it in periodic output. Temperature is **not** used in the solver's
+budget allocation — on laptops, temperature is an ambient condition (GPU heat,
+VRM heat, battery heat) that doesn't reliably indicate CPU power draw. The
+GPU-first power budget (`PL1 - GPU - headroom`) is the only real constraint.
 
-| Temp | `max_perf` cap | Turbo | EPP | Extra headroom |
-|------|---------------|-------|-----|----------------|
-| ≤70°C | 100% (no cap) | — | (aggression-based) | 0 W |
-| 70→80°C | 100→60% (linear) | — | — | 0→2.5 W |
-| 80→82°C | 60→52% | — | `balance_power` | 2.5→3 W |
-| 82→85°C | 52→40% | forced off | `balance_power` | 3→3.75 W |
-| 85→90°C | 40→20% | forced off | forced `power` | 3.75→5 W |
-| ≥90°C | 20% (floor) | forced off | forced `power` | 5 W |
-
-The extra headroom increases the PL1 margin, starving the core budget so
-package power drops and the CPU cools.
+Temperature is still logged in periodic syslog lines (`temp=85C`) and
+shown by `power-status` for operator awareness.
 
 ### GPU throttle monitoring
 
-The daemon watches the Xe driver's 8 throttle reason flags (pl1, pl2, pl4,
-prochot, thermal, ratl, vr_tdc, vr_thermalert).  Rising-edge events are
+The daemon watches the Xe driver's 8 throttle reason flags:
+`reason_pl1`, `reason_pl2`, `reason_pl4`, `reason_prochot`,
+`reason_thermal`, `reason_ratl`, `reason_vr_tdc`, `reason_vr_thermalert`.
+Sysfs path: `gt0/freq0/throttle/reason_*`. Rising-edge events are
 accumulated in counters, printed in periodic log lines as `gpu-throttle:`,
-and summarized on exit.  Throttle detection is suppressed for the first 3
+and summarized on exit. Throttle detection is suppressed for the first 3
 cycles to let RAPL counters settle.
 
-PL4 is **excluded from aggression detection** — it is the GPU tile's normal
-peak current management handled by the GuC firmware.  All 8 reasons are
-still tracked and logged.
+PL1/PL2 are expected under load, PL4 is normal GuC peak current management,
+and PROCHOT is an external pin signal — none of these affect the optimizer's
+gpu_throttling flag. GPU **thermal**, **ratl** (runtime thermal limit), **vr_tdc**
+(thermal current limit), and **vr_thermalert** (over-temperature) set
+gpu_throttling=true which invokes the throttle penalty in the utility function.
+All 8 reasons are still tracked and logged.
 
 ### GPU power profile
 
-The daemon forces both GPU tiles (gt0 render, gt1 media) to the `base`
-power profile at startup, overriding the `power_saving` default.  The
+The daemon forces both GPU tiles (gt0 render, gt1 media) to the `power_saving`
+power profile at startup, overriding the `base` default.  The
 original profile is saved and restored on exit.  GPU performance is
 non-negotiable — all CPU controls are the expendable variable.
 
 ### CPU MSR perf limit monitoring
 
-The daemon reads MSR 0x6B0 (Package Perf Limit Reasons) each cycle and logs
-currently active CPU throttle reasons as `cpu-throttle:` in the periodic log
-line (e.g., `cpu-throttle: Core/Cache` when PP0 core budget is capped).
-Rising-edge events are accumulated per reason and reported on exit.
+The daemon reads `MSR_CORE_PERF_LIMIT_REASONS` (0x690 on Haswell–Skylake,
+0x64F on Meteor Lake+) each cycle and logs currently active CPU throttle
+reasons as `cpu-throttle:` in the periodic log line (e.g.,
+`cpu-throttle: Core/Cache` when PP0 core budget is capped). Rising-edge
+events are accumulated per reason and reported on exit.
+
+Bit layout (lower 16 = current status): PROCHOT(0), Thermal(1),
+Current(EDP)(2), Power(PL1)(3), Platform(4), Autonomous(5),
+VR_Temp(6), HTC(7), Core/Cache(8), Amps(9), PROCHOT_Deassert(10),
+PL4/Peak(11), PkgPwrLatch(12), Clipping(13).
 
 PROCHOT (bit 0) is excluded from the `cpu-throttle:` line and from
 aggregation — see PROCHOT handling below.
@@ -98,78 +131,23 @@ aggregation — see PROCHOT handling below.
 ### PROCHOT handling
 
 Many laptop ECs assert the PROCHOT# signal aggressively, even at low
-temperatures and idle power.  On this Acer Meteor Lake platform the EC
-asserts PROCHOT# at ~44°C / 4 W due to an insufficient charger (see below).
+temperatures and idle power.  The daemon disables the CPU's response to
+external PROCHOT# by clearing MSR 0x1FC (MSR_POWER_CTL) bit 0 (BD_PROCHOT)
+at startup.  This MSR write is persistent (the EC/firmware does not
+re-enable this bit between reads), so a one-time clear is sufficient.
+The original MSR value is saved on startup and restored on exit.
 
-The daemon disables the CPU's response to external PROCHOT# by clearing
-MSR 0x1FC bit 0 every cycle.  The EC/firmware continuously re-enables this
-bit, so a one-time clear at startup is not sufficient — the daemon must
-rewrite it each cycle.  The original MSR value is saved on startup and
-restored on exit.
-
-When PROCHOT# assertion is detected in MSR 0x6B0, the daemon checks the
-power supply subsystem for signs of an inadequate charger:
-
-- Battery **Discharging** or **Not charging** while AC is online
-- USB-C Power Delivery contract below 45 W
-
-If a weak or insufficient charger is identified, a `LOG_WARNING` is emitted
-(ratelimited to once per ~60 s):
-
-```
-PROCHOT asserted — insufficient charger: battery Not charging; 15W USB-C charger
-```
-
-This gives the user a direct, actionable diagnostic instead of silently
-tolerating performance loss from a power-limited charge source.  The daemon
-continues to clear the PROCHOT# response regardless, so normal operation
-is unaffected while the warning is displayed.
-
-### Weak charger power-save mode
-
-When PROCHOT# from an insufficient charger is detected, the daemon goes a
-step further than just tolerating it: it enters **power-save** mode and
-aggressively reduces system power draw to stay within the charger's capacity.
-
-The power-save mode applies every available control simultaneously:
-
-| Control | Setting |
-|---------|---------|
-| Package PL1 | Lowered to ~50% of charger capacity (e.g., 7.5 W for a 15 W USB-C charger) |
-| Turbo | Forced off (`no_turbo=1`) |
-| `max_perf_pct` | Capped to 20% |
-| EPP (all cores) | Forced to `power` |
-| `min_perf_pct` | Forced to 0 for deepest idle states |
-| GPU `max_freq` | gt0 capped to 800 MHz, gt1 capped to 100 MHz |
-| GPU power profile | Switched to `power_saving` |
-| Uncore (PP1) budget | Capped to 3 W (instead of unlimited) |
-| CPU hotplug | Keep only 2 core groups (~4 threads) |
-| `intel_powerclamp` | 20% forced idle injection at package level |
-
-The charger is checked every 10 seconds.  When an adequate charger is
-detected (e.g., switching from USB-C to the barrel connector), all controls
-are restored to their normal aggression/temperature-derived values.
-
-The `[power-save]` state is displayed in the log state tag:
-
-```
-[power-save] pkg=3.6W core=0.9W gpu=0.1W(gpu_sm=0.1W) pl1=7.5W core_lmt=5.4W max_perf=20% no_turbo=1 epp=power  temp=51C  gpu-throttle: prochot:1
-```
-
-A transition message is logged on entry and exit:
-
-```
-weak charger: 15W USB-C charger — enabling power saving
-adequate charger detected — disabling power saving
-```
+NOTE: PROCHOT# assertion detection, charger-adequacy checking, and
+the weak-charger power-save mode are **not yet implemented** in the
+daemon code. They are documented as planned future features.
 
 ### CPU controls
 
 | Control | Mechanism | Notes |
 |---------|-----------|-------|
-| Frequency cap | `intel_pstate/max_perf_pct` | Scaled by aggression level and temperature |
-| Turbo | `intel_pstate/no_turbo` | Forced off when GPU draws >15 W, GPU throttling, or temp ≥82°C |
-| EPP | `energy_performance_preference` per CPU | Per-cluster: P-cores throttled first, E-cores 1 tier less aggressive. Cycles through `balance_performance` / `balance_power` / `power` — never `performance` |
+| Frequency cap | `intel_pstate/max_perf_pct` | Scaled by GPU-first CPU budget; floor at 20% |
+| Turbo | `intel_pstate/no_turbo` | Disabled when GPU is throttling or CPU demand ratio > 0.7 |
+| EPP | `energy_performance_preference` per CPU | Per-cluster with hysteresis: E-cores get one tier less aggressive EPP than P-cores when GPU is not throttling. P-cores cycle through `balance_performance` → `balance_power` → `power`. EPP changes use hysteresis (0.15 ratio margin) to prevent flip-flopping. The `performance` EPP is never set.
 | RAPL PP0 | `constraint_0_power_limit_uw` | Core budget derived from PL1 minus GPU draw |
 | CPU hotplug | core offlining via `cpu/online` | P-cores offlined first (keeping at least 2), then E-cores |
 
@@ -177,25 +155,27 @@ All CPU controls are saved on startup and restored on exit (SIGINT/SIGTERM/SIGHU
 
 ### CPU hotplug (core offlining)
 
-In heavy/throttling states the daemon offlines entire physical cores to
-eliminate leakage and switching power.  Cores are grouped by physical core
-(HT siblings share a group).  The offlining priority is:
+When CPU power demand is low, the daemon offlines entire physical cores to
+eliminate leakage and switching power, freeing that power for the GPU.
+Cores are grouped by physical core (HT siblings share a group).  The
+offlining priority is:
 
 1. **P-cores** offlined first (highest CPU number first)
 2. **E-cores** offlined next (highest CPU number first)
-3. **CPU0's group and at least 2 P-core groups** are always kept online
+3. **At least `min_core_groups` (2) groups** are always kept online
 
-The number of groups to keep depends on aggression and temperature:
+The number of groups to keep is determined by the ratio of CPU power budget
+to CPU reference power (computed by `choose_keep_groups()`):
 
-| State | Groups kept |
-|-------|-------------|
-| idle/cool (<70°C) | All groups |
-| moderate (active, 70–80°C) | 12 groups |
-| heavy (GPU >15 W, 80–85°C) | 8 groups |
-| throttle (GPU throttling, 85–90°C) | 4 groups |
-| critical (aggression≥2, ≥90°C) | 1 group (P-core group with CPU0) |
+| CPU power ratio | Groups kept |
+|----------------|-------------|
+| > 0.9 (CPU saturated) | All groups (0 = no offlining) |
+| 0.7 – 0.9 | ≤ 12 groups |
+| 0.5 – 0.7 | ≤ 8 groups |
+| 0.3 – 0.5 | ≤ 4 groups |
+| < 0.3 | 2 groups (min_core_groups floor) |
 
-Changes are throttled with a 20-cycle settle period (~10 s).  `min_perf_pct`
+Changes are applied with a 20-cycle settle period (~10 s).  `min_perf_pct`
 is dropped to 0 when any cores are offlined so remaining idle cores reach
 minimum frequency and deepest C-states.  Initial online state is saved on
 startup and restored on exit.
@@ -206,8 +186,8 @@ All hardware paths are discovered dynamically at startup:
 
 - **RAPL**: scans `intel-rapl` and `intel-rapl-mmio` under
   `/sys/class/powercap/`, discovers PP0 (core) and PP1 (uncore) subdomains
-- **GPU**: scans `/sys/class/drm/card*/device/tile0/gt0/freq0/cur_freq` for
-  the Xe driver
+- **GPU**: scans `/sys/class/drm/card*/device/gt*/freq0/cur_freq` for
+  the Xe driver (gt0 = render, gt1 = media)
 - **Temperature**: scans `/sys/class/hwmon/` for the `coretemp` driver
 - **CPU count**: enumerates `/sys/devices/system/cpu/cpu*`
 
@@ -218,7 +198,7 @@ Works on machines with or without a GPU (GPU-only mode).
 ### Build
 
 ```sh
-g++ -std=c++17 -O2 src/power-balance.cpp -o power-balance
+g++ -std=c++17 -O2 src/power-balance.cpp src/power-optimizer.cpp src/power-utils.cpp src/msr_platform.cpp src/scheduler-stats.cpp -o power-balance
 ```
 
 Or via CMake:
@@ -250,15 +230,15 @@ Logs are available via `journalctl -u power-balance`.
 ### Log output
 
 ```
-[active] pkg=25.4W core=8.0W gpu=12.5W(gpu_sm=11.5W) pl1=40.0W 
+[active] pkg=25.4W core=8.0W gpu=12.5W(gpu_sm=11.5W) pl1=40.0W
   core_lmt=24.8W max_perf=62% no_turbo=0 epp=balance_power  temp=77C  
-  gpu-throttle: pl4:2
+  c0=45% demand=0.58 gpu-throttle: pl4:2
 ```
 
 ```
-[balance-throttle] pkg=25.4W core=7.7W gpu=11.3W(gpu_sm=12.1W) pl1=40.0W 
+[throttle] pkg=25.4W core=7.7W gpu=11.3W(gpu_sm=12.1W) pl1=40.0W
   core_lmt=8.0W max_perf=20% no_turbo=1 epp=power(balance_power)  temp=85C  
-  gpu-throttle: pl4:4  cpu-throttle: Core/Cache
+  demand=0.22 gpu-throttle: pl4:4  cpu-throttle: Core/Cache
 ```
 
 ```

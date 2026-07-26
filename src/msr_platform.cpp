@@ -177,6 +177,33 @@ bool probe_msr_write_with_value(uint32_t msr_addr, unsigned long long val) {
     return ok;
 }
 
+// ── Early-exit message for unsupported platforms ──
+static const char* k_unsupported_header =
+    "UNSUPPORTED CPU — this daemon requires explicit MSR support.";
+static const char* k_unsupported_footer_template =
+    "\nSupported platforms (Intel Family 6, models):\n"
+    "  Haswell      0x3C,0x3F,0x45,0x46     "
+    "  Broadwell    0x3D,0x47,0x4F,0x56\n"
+    "  Skylake      0x4E,0x55,0x5E     "
+    "  Kaby/Coffee  0x8E,0x9E,0xA5,0xA6\n"
+    "  Ice Lake     0x6A,0x6C,0x7D,0x7E,0x9D\n"
+    "  Alder Lake   0x97,0x9A       "
+    "  Raptor Lake  0xB7,0xBA,0xBF\n"
+    "  Meteor Lake  0xAC,0xAA       "
+    "  Lunar Lake   0xBD\n"
+    "\nThis CPU (model 0xHEX) is not on the supported list.\n"
+    "Add it to is_legacy_perf_limit_family(), is_adl_rpl_family(),\n"
+    "or is_meteor_lake_family() as appropriate, then rebuild.";
+
+static std::string k_unsupported_footer(uint32_t model) {
+    std::string s = k_unsupported_footer_template;
+    std::string hex = "0x" + std::to_string(model);
+    size_t pos = s.find("0xHEX");
+    if (pos != std::string::npos)
+        s.replace(pos, 5, hex);
+    return s;
+}
+
 PlatformMSRs validate_msrs(const PlatformMSRs& candidate) {
     PlatformMSRs result = candidate;
 
@@ -263,11 +290,11 @@ PlatformDetectResult detect_platform_msrs() {
     const char* gen_name = "unknown";
 
     if (family != FAM) {
-        // Non-family-6 — return empty with descriptive message
+        // Non-Family-6 CPUs (e.g. Diamond Rapids/Family 19, Novalake/Family 18)
+        // are not supported. There is no safe fallback.
         res.ok = false;
-        res.message = "non-family-6 CPU (family=" + std::to_string(family) +
-                      " model=" + std::to_string(model) +
-                      ") — using safe defaults";
+        res.message = std::string(k_unsupported_header) + " (family=" +
+                      std::to_string(family) + ", not Family 6)";
         return res;
     }
 
@@ -281,9 +308,14 @@ PlatformDetectResult detect_platform_msrs() {
         gen_name = "Haswell-Skylake era";
         table = &msr_legacy_perf_limit;
     } else {
-        // Unknown model — use legacy table as starting point, will probe
-        gen_name = "unknown (probing)";
-        table = &msr_legacy_perf_limit;
+        // Unknown Family-6 model — reject. No safe fallback exists.
+        // The perf-limit MSR address varies by generation; guessing is worse than
+        // failing.  Update the matching function above to recognize this model.
+        res.ok = false;
+        res.message = std::string(k_unsupported_header) + " (model 0x" +
+                      std::to_string(model) + ", unrecognized)" +
+                      k_unsupported_footer(model);
+        return res;
     }
 
     PlatformMSRs result = validate_msrs(*table);
@@ -429,4 +461,9 @@ unsigned long long platform_read_rapl_pkg_limit() {
     if (!g_msrs_initialized) init_platform_msrs();
     if (g_platform_msrs.rapl_pkg_limit == 0) return 0;
     return probe_msr_read(g_platform_msrs.rapl_pkg_limit);
+}
+
+bool platform_ok() {
+    if (!g_msrs_initialized) init_platform_msrs();
+    return g_platform_msrs.cpu_perf_limit != 0;
 }

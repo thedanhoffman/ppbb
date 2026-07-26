@@ -1,6 +1,6 @@
 // power-status.cpp — simple terminal power monitor
 // Only uses 3-bit ANSI foreground colors (30-37) + reset (0) for max compatibility
-// Compile: g++ -std=c++17 -O2 power-status.cpp -o power-status
+// Compile: g++ -std=c++17 -O2 power-status.cpp power-utils.cpp msr_platform.cpp -o power-status
 
 #include <algorithm>
 #include <chrono>
@@ -112,29 +112,7 @@ static void track_gpu_throttle(GpuThrottleState& state, const std::string& throt
     }
 }
 
-// Clear Performance Limit Reasons (MSR 0x690 — MSR_CORE_PERF_LIMIT_REASONS).
-// Writing 0 clears current reasons + all sticky/history (log) bits.
-// Useful for resetting so that new throttling blips can be observed from zero.
-//
-// Note: 0x6B0 (MSR_GFX_PERF_LIMIT_REASONS) is the GPU-domain register —
-// not relevant for CPU perf-limit tracking.
-// 0x6B1 (MSR_RING_PERF_LIMIT_REASONS) is the Ring/Uncore register — not
-// a thermal log as previously documented.
-static void clear_perf_limit_history() {
-    if (!msr_available()) {
-        std::cout << color(YEL, "   [PLR clear skipped — MSR unavailable]") << std::endl;
-        return;
-    }
-    init_platform_msrs();
-    bool ok0 = platform_clear_cpu_perf_limit(0);
-    if (ok0) {
-        std::cout << color(GRN, "   ✓ Perf-limit history cleared") << std::endl;
-    } else {
-        std::cout << color(RED, "   ✗ Failed to clear perf-limit history (check permissions)") << std::endl;
-    }
-}
-
-// Intel Perf Limit Reasons bit definitions for MSR 0x690 (MSR_CORE_PERF_LIMIT_REASONS)
+// Intel Perf Limit Reasons bit definitions (platform-determined MSR: 0x690 or 0x64F)
 // Lower 16 bits = current status, upper 16 bits = sticky (LOG)
 // Using shared PERF_LIMIT_REASONS_BITS from power-utils.h
 // Perf limit event tracking (accumulated across refresh cycles)
@@ -346,6 +324,8 @@ struct RAPLState {
 };
 
 static RAPLState g_pkg_rapl;  // tracks package-0 energy
+static RAPLState g_core_rapl; // tracks core (PP0) energy
+static RAPLState g_uncore_rapl; // tracks uncore (PP1) energy
 
 // ── Main ──
 
@@ -429,10 +409,9 @@ static void refresh() {
     std::cout << color(YEL, "⚙️  Performance Limits & Throttling") << std::endl;
 
     // ── Perf Limit Reasons table ──
-    bool msr_ok = msr_available();
     unsigned long long pkg_reasons = 0;
     unsigned int pkg_current = 0, pkg_logged = 0;
-    if (msr_ok) {
+    if (platform_ok()) {
         // Read CPU perf-limit MSR (platform-determined: 0x64F or 0x690) — lower 16 = current
         // status, upper 16 = sticky log.
         pkg_reasons = platform_read_cpu_perf_limit(0);
@@ -450,12 +429,12 @@ static void refresh() {
         g_prev_pkg_current = pkg_current;
     }
 
-    // Read per-core MSR 0x690
+    // Read per-core perf-limit MSR (platform-determined)
     struct CorePlr {
         unsigned int cur = 0, log = 0;
     };
     std::vector<CorePlr> core_plrs(cpu_count);
-    if (msr_ok) {
+    if (platform_ok()) {
         for (int c = 0; c < cpu_count; ++c) {
             unsigned long long cv = platform_read_cpu_perf_limit(c);
             core_plrs[c].cur = cv & 0xFFFF;
@@ -495,7 +474,7 @@ static void refresh() {
         }
         t.print();
     }
-    if (!msr_ok) {
+    if (!platform_ok()) {
         std::cout << color(YEL, "   ⚠ MSR unavailable — run with sudo for Perf Limit Reasons") << std::endl;
     }
 
@@ -537,7 +516,7 @@ static void refresh() {
     }
 
     // ── Accumulated events since tool start ──
-    if (msr_ok) {
+    if (platform_ok()) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - g_start_time).count();
         Table t({"reason", "cnt", "total_ms"});
@@ -561,22 +540,27 @@ static void refresh() {
     {
         auto domains = read_all_rapl_domains();
 
-        // Compute live package power from energy_uj delta
+        // Compute live power from energy_uj delta (package, core, uncore)
         if (!domains.empty()) {
-            for (auto& d : domains) {
-                if (d.name == "package-0" && d.energy_uj >= 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (!g_pkg_rapl.first && g_pkg_rapl.prev_energy >= 0) {
-                        long long delta_uj = d.energy_uj - g_pkg_rapl.prev_energy;
-                        auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(now - g_pkg_rapl.prev_time).count();
-                        if (delta_us > 0) {
-                            g_pkg_rapl.live_power_w = (double)delta_uj / delta_us;
-                        }
+            auto now = std::chrono::steady_clock::now();
+            auto update_rapl = [&now](RAPLState& st, double energy_uj) {
+                if (!st.first && st.prev_energy >= 0) {
+                    long long delta_uj = (long long)energy_uj - st.prev_energy;
+                    auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - st.prev_time).count();
+                    if (delta_us > 0 && delta_uj >= 0) {
+                        st.live_power_w = (double)delta_uj / delta_us;
                     }
-                    g_pkg_rapl.prev_energy = d.energy_uj;
-                    g_pkg_rapl.prev_time = now;
-                    g_pkg_rapl.first = false;
-                    break;
+                }
+                st.prev_energy = (long long)energy_uj;
+                st.prev_time = now;
+                st.first = false;
+            };
+            for (auto& d : domains) {
+                if (d.energy_uj >= 0) {
+                    if (d.name == "package-0") update_rapl(g_pkg_rapl, d.energy_uj);
+                    else if (d.name == "core" || d.name == "pp0") update_rapl(g_core_rapl, d.energy_uj);
+                    else if (d.name == "uncore" || d.name == "pp1") update_rapl(g_uncore_rapl, d.energy_uj);
                 }
             }
         }
@@ -610,18 +594,24 @@ static void refresh() {
             }
 
             std::string draw;
-            if (d.name == "package-0" && g_pkg_rapl.live_power_w >= 0) {
-                const char* col = GRN;
-                if (g_pkg_rapl.live_power_w > pl1_eff / 1e6) col = YEL;
-                if (g_pkg_rapl.live_power_w > (d.pl4_uw > 0 ? d.pl4_uw / 1e6 : 999)) col = RED;
-                draw = color(col, fmt_power_double(g_pkg_rapl.live_power_w));
+            { // pick live power tracker for this domain
+                RAPLState* st = nullptr;
+                if (d.name == "package-0") st = &g_pkg_rapl;
+                else if (d.name == "core" || d.name == "pp0") st = &g_core_rapl;
+                else if (d.name == "uncore" || d.name == "pp1") st = &g_uncore_rapl;
+                if (st && st->live_power_w >= 0) {
+                    const char* col = GRN;
+                    if (st->live_power_w > pl1_eff / 1e6) col = YEL;
+                    if (d.pl4_uw > 0 && st->live_power_w > d.pl4_uw / 1e6) col = RED;
+                    draw = color(col, fmt_power_double(st->live_power_w));
+                }
             }
 
             std::string pl1_cell = val_cell(pl1_eff, d.pl1_window_us);
             if (clamped) pl1_cell += color(YEL, "!");
 
             std::string lock;
-            if (msr_ok && d.name == "package-0") {
+            if (platform_ok() && d.name == "package-0") {
                 unsigned long long msr = platform_read_rapl_pkg_limit();
                 if ((msr >> 63) & 1) lock = color(RED, "LOCKED");
                 else if ((msr >> 16) & 1) lock = color(YEL, "clamp-on");
@@ -844,7 +834,7 @@ static void refresh() {
                 os << std::fixed << std::setprecision(1) << (max_freq_khz / 1000000.0) << " GHz";
                 std::cout << "   Freq:       " << color(ratio > 0.9 ? GRN : ratio > 0.5 ? WHT : YEL, freq_str);
                 std::cout << " of " << color(WHT, os.str());
-                if (ratio < 0.5 && msr_ok) {
+                if (ratio < 0.5 && platform_ok()) {
                     std::cout << " " + color(RED, "(throttled)");
                 }
                 std::cout << std::endl;
@@ -855,7 +845,7 @@ static void refresh() {
     }
 
     // ── Throttling summary (only known active reasons) ──
-    if (msr_ok) {
+    if (platform_ok()) {
         unsigned long long pkg_now = platform_read_cpu_perf_limit(0);
         unsigned int cur = pkg_now & 0xFFFF;
         bool known_active = false;
@@ -881,7 +871,7 @@ static void refresh() {
     }
 
     // ── Tuning capability summary ──
-    if (msr_ok) {
+    if (platform_ok()) {
         unsigned long long msr610 = platform_read_rapl_pkg_limit();
         bool msr_locked = (msr610 >> 63) & 1;
         bool pl1_clamp = (msr610 >> 16) & 1;
@@ -942,23 +932,29 @@ static void refresh() {
 }
 
 int main(int argc, char** argv) {
-    bool clear_plr = false;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--clear-plr") == 0) {
-            clear_plr = true;
-        }
-    }
-
-    // Clear PLR history before entering the monitoring loop.
-    // This resets all sticky/perf-limit bits so new throttling events
-    // (including sub-second blips) are observed from a clean slate.
-    if (clear_plr) {
-        std::cout << "\033[H\033[2J";  // clear screen
-        clear_perf_limit_history();
-    }
+    (void)argc; (void)argv;  // power-status is read-only; no flags
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
+
+    // ── Platform support check (must pass before any MSR read) ──
+    init_platform_msrs();
+    if (!platform_ok()) {
+        std::string msg = detect_platform_msrs().message;
+        size_t pos = msg.find('\n');
+        if (pos != std::string::npos) {
+            std::cout << msg.substr(0, pos) << std::endl;
+            for (size_t i = pos + 1; i < msg.size(); ) {
+                size_t nl = msg.find('\n', i);
+                if (nl == std::string::npos) nl = msg.size();
+                std::cout << msg.substr(i, nl - i) << std::endl;
+                i = nl + 1;
+            }
+        } else {
+            std::cout << msg << std::endl;
+        }
+        return 1;
+    }
 
     const int interval_sec = 5;
     while (g_running) {

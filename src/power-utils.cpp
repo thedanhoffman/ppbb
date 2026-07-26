@@ -3,6 +3,7 @@
 // See power-utils.h for API documentation.
 
 #include "power-utils.h"
+#include <cmath>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -224,4 +225,30 @@ int read_gpu_temp() {
 
 int read_nvme_temp() {
     return find_temperature("nvme");
+}
+
+// ═══════════════════════════════════════════════════════════
+// Energy sampling helpers
+// ═══════════════════════════════════════════════════════════
+
+Sample read_energy(const std::string& dir) {
+    Sample s;
+    sysfs_read_attr(dir, "energy_uj", s.energy_uj);
+    s.time = std::chrono::steady_clock::now();
+    return s;
+}
+
+double compute_power_w(const Sample& prev, const Sample& cur) {
+    if (prev.energy_uj < 0 || cur.energy_uj < 0) return 0;
+    long long delta_uj = cur.energy_uj - prev.energy_uj;
+    if (delta_uj < 0) return -1.0;
+    auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        cur.time - prev.time).count();
+    if (delta_us <= 0) return 0.0;
+    return static_cast<double>(delta_uj) / delta_us;
+}
+
+double round_to_125mw(double watts) {
+    if (watts < 0) return 0;
+    return std::round(watts / 0.125) * 0.125;
 }
