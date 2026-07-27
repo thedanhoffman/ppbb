@@ -1516,7 +1516,8 @@ int main(int argc, char** argv) {
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
                    pl1_w, res.core_limit_w, res.max_perf_pct, res.no_turbo, epp_str.c_str(),
                    temp_buf, res_buf, throttle_summary.c_str(), c0_buf,
-                   res.keep_groups, res.keep_groups < 0 ? "gpu" : "cpu");
+                   res.keep_groups,
+                   res.keep_groups < 0 ? (core_w < 3.0 ? "idle" : "gpu") : "cpu");
             last_aggression = aggression;
         }
 

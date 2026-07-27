@@ -170,12 +170,17 @@ static bool choose_turbo(double cpu_measured_w,
 // online threshold (gpu_active_thresh > gpu_idle_thresh), creating a dead band.
 //
 // Budget-driven hotplug with mode-aware core selection.
-// Two modes determined by workload character:
+// Three modes determined by workload character:
 //
 //   GPU-heavy (gpu_power > 3W && cpu_demand < 0.5):
 //     Package power is consumed by GPU; CPU is idle.
 //     Shed P-cores first (they leak more), keep E-cores.
 //     Return negative count (apply_hotplug keeps last |N| = E-first + CPU0).
+//
+//   Idle (cpu_draw < 3W):
+//     CPU is barely doing anything. No need for P-core speed.
+//     E-cores are cheaper to run; shed P-cores, keep E-cores.
+//     Return negative count (E-first).
 //
 //   CPU-heavy (default):
 //     CPU threads need speed; GPU is background.
@@ -196,15 +201,15 @@ static int choose_keep_groups(double cpu_budget, double cpu_draw,
 
     // ── Determine mode ──
     int ecore_count = total_groups - pcore_count;
-    bool gpu_heavy = (gpu_power_w > 3.0 && cpu_demand < 0.5);
+    bool e_first = (gpu_power_w > 3.0 && cpu_demand < 0.5) || (cpu_draw < 3.0);
 
     // ── Budget-vs-draw ratio ──
     double ratio = (cpu_draw > 0) ? cpu_budget / cpu_draw : 1.0;
     ratio = std::max(0.1, std::min(2.0, ratio));
 
     int target;
-    if (gpu_heavy) {
-        // ── GPU-heavy mode: shed P-cores, keep E-cores ──
+    if (e_first) {
+        // ── E-first mode (GPU-heavy or idle): shed P-cores, keep E-cores ──
         // E-cores are always kept; P-cores scaled by budget.
         // CPU0's group is always online (enforced by apply_hotplug).
         if (ratio > 1.5) {
@@ -240,14 +245,14 @@ static int choose_keep_groups(double cpu_budget, double cpu_draw,
         target = std::max(target, total_groups - 2);
     } else if (cpu_demand > 0.4) {
         target = std::max(target, total_groups / 2);
-    } else if (cpu_demand > 0.15 && !gpu_heavy) {
+    } else if (cpu_demand > 0.15 && !e_first) {
         target = std::max(target, pcore_count);
     }
 
     target = std::max(1, std::min(target, total_groups));
 
     // ── Encode mode as sign ──
-    int encoded = gpu_heavy ? -target : target;
+    int encoded = e_first ? -target : target;
 
     // ── Smoothing: prefer previous if close (compare absolute values) ──
     int prev_abs = std::abs(prev_keep_groups);
