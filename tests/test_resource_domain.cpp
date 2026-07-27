@@ -357,17 +357,22 @@ TEST(SolveResources, HotplugSmoothingPerType) {
 
     auto result = solve_resources(inputs, cfg);
 
-    // Smoothing: prev preserves if within 1 of current
+    // Smoothing: prev preserves if within 2 of current
     inputs.prev_keep_p = result.keep_p;
     inputs.prev_keep_e = result.keep_e;
     auto result2 = solve_resources(inputs, cfg);
     EXPECT_EQ(result2.keep_p, result.keep_p);
     EXPECT_EQ(result2.keep_e, result.keep_e);
 
-    // Different prev within 1 → keep prev
-    inputs.prev_keep_p = result.keep_p + 1;
+    // Different prev within 2 → keep prev (wider band)
+    inputs.prev_keep_p = result.keep_p + 2;
     auto result3 = solve_resources(inputs, cfg);
-    EXPECT_EQ(result3.keep_p, result.keep_p + 1);  // within 1 → keep prev
+    EXPECT_EQ(result3.keep_p, result.keep_p + 2);  // within 2 → keep prev
+
+    // Different prev beyond 2 → use new value
+    inputs.prev_keep_p = result.keep_p + 3;
+    auto result4 = solve_resources(inputs, cfg);
+    EXPECT_EQ(result4.keep_p, result.keep_p);  // beyond 2 → use new value
 }
 
 TEST(SolveResources, CpuOnlyHighDemand) {
@@ -391,6 +396,37 @@ TEST(SolveResources, CpuOnlyHighDemand) {
     // High demand → demand boost raises counts
     EXPECT_GT(result.keep_p, 0);
     EXPECT_LE(result.keep_e, result.keep_p);
+}
+
+TEST(SolveResources, DemandDeadbandIgnoresSmallBumps) {
+    ResourceConfig cfg;
+    cfg.min_core_groups = 1;
+    ResourceInputs inputs{};
+    inputs.pl1_w = 40.0;
+    inputs.gpu_power_w = 0.0;
+    inputs.have_gpu = false;
+    inputs.temp_c = 50.0;
+    inputs.cpu_demand = 0.15;   // small bump — below deadband of 0.3
+    inputs.gpu_c0_pct = 0.0;
+    inputs.gpu_power_var_w = 0.0;
+    inputs.cpu_measured_w = 5.0;
+    inputs.total_core_groups = 16;
+    inputs.pcore_count = 6;
+
+    auto result_low = solve_resources(inputs, cfg);
+
+    inputs.cpu_demand = 0.25;   // still below deadband
+    auto result_high = solve_resources(inputs, cfg);
+
+    // Small demand bumps should not change hotplug target
+    EXPECT_EQ(result_low.keep_p, result_high.keep_p);
+    EXPECT_EQ(result_low.keep_e, result_high.keep_e);
+
+    // But demand > 0.3 should raise counts
+    inputs.cpu_demand = 0.60;
+    auto result_beyond = solve_resources(inputs, cfg);
+    EXPECT_GE(result_beyond.keep_p + result_beyond.keep_e,
+              result_low.keep_p + result_low.keep_e);
 }
 
 // ═══════════════════════════════════════════════════════════

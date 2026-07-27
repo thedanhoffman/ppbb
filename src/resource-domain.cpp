@@ -248,8 +248,13 @@ static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
         if (w < 0.5) keep_p = 1; else keep_e = 1;
     }
 
-    // ── Demand boost: smooth increase instead of hard floors ──
-    double demand_boost = 1.0 + cpu_demand * 0.5;  // 1.0 → 1.5
+    // ── Demand boost: deadband then smooth increase ──
+    // Ignore small demand bumps (transient spikes) — only bring cores online
+    // when demand is sustained and meaningfully high.
+    double demand_boost = 1.0;
+    if (cpu_demand > 0.3) {
+        demand_boost = 1.0 + (cpu_demand - 0.3) * 0.7;  // 1.0 → 1.49 over [0.3, 1.0]
+    }
     keep_p = static_cast<int>(std::ceil(keep_p * demand_boost));
     keep_e = static_cast<int>(std::ceil(keep_e * demand_boost));
 
@@ -257,11 +262,13 @@ static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
     keep_p = std::max(0, std::min(keep_p, pcore_count));
     keep_e = std::max(0, std::min(keep_e, ecore_count));
 
-    // ── Smoothing per-type: delta ≤ 1 → keep prev ──
-    if (prev_keep_p > 0 && keep_p > 0 && std::abs(keep_p - prev_keep_p) <= 1) {
+    // ── Smoothing per-type: delta ≤ 2 → keep prev ──
+    // Wider band: small oscillations (1-2 cores) don't trigger hotplug.
+    // This prevents P-cores from flipping on/off for instantaneous CPU bumps.
+    if (prev_keep_p > 0 && keep_p > 0 && std::abs(keep_p - prev_keep_p) <= 2) {
         keep_p = prev_keep_p;
     }
-    if (prev_keep_e > 0 && keep_e > 0 && std::abs(keep_e - prev_keep_e) <= 1) {
+    if (prev_keep_e > 0 && keep_e > 0 && std::abs(keep_e - prev_keep_e) <= 2) {
         keep_e = prev_keep_e;
     }
 

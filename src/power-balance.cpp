@@ -667,7 +667,7 @@ static void apply_hotplug(CpuState& c, int keep_p, int keep_e) {
         }
         syslog(LOG_INFO, "hotplug: %d groups online (P=%d E=%d, target=P=%d E=%d, prev=P=%d E=%d)",
                new_count, new_p, new_e, keep_p, keep_e, cur_p, cur_e);
-        c.hotplug_settle = 6;
+        c.hotplug_settle = 10;  // 2s cooldown (10 × 200ms) after hotplug action
     }
 }
 
