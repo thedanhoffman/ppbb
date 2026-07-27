@@ -95,10 +95,10 @@ struct ResourceResult {
     EppLevel epp_e          = EppLevel::BalancePerformance;  // E-core EPP
 
     // CPU topology (hotplug)
-    int    keep_groups      = 0;    // core groups to keep online
-                                            // >0: keep first N groups (P-first, CPU-heavy)
-                                            // <0: keep |N| groups, E-first (GPU-heavy)
-                                            // =0: keep all online
+    int    keep_p           = 0;    // P-core groups to keep online (0 = all P)
+    int    keep_e           = 0;    // E-core groups to keep online (0 = all E)
+    // Convention: keep_p=0 or keep_e=0 means "keep all of that type"
+    // Both = 0 → all cores online (most conservative)
 
     // Diagnostics
     double thermal_surrender = 0.0; // UNUSED — thermal surrender disabled (always 0.0)
@@ -155,7 +155,8 @@ struct ResourceInputs {
     int     prev_max_perf      = 100;
     EppLevel prev_epp_p        = EppLevel::BalancePerformance;
     EppLevel prev_epp_e        = EppLevel::BalancePerformance;
-    int     prev_keep_groups   = 0;  // previous keep_groups (for hysteresis)
+    int     prev_keep_p        = 0;  // previous P-core groups kept (for hysteresis)
+    int     prev_keep_e        = 0;  // previous E-core groups kept (for hysteresis)
 };
 
 // ═══════════════════════════════════════════════════════════

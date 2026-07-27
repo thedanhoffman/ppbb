@@ -123,7 +123,8 @@ struct CpuState {
     std::vector<std::string> ecore_epp_paths;
     // Core groups
     std::vector<CoreGroup>   core_groups;
-    int    keep_groups_target = -1;
+    int    keep_p_target = 0;  // last applied P-core target
+    int    keep_e_target = 0;  // last applied E-core target
     int    hotplug_settle = 0;
 };
 
@@ -558,23 +559,41 @@ static void discover_topology(CpuState& c) {
 // Issue #4 fix: uses result.keep_groups from solve() instead of standalone
 // compute_keep_groups(). The optimizer's power-ratio-based approach is the
 // single canonical source for hotplug decisions.
-static void apply_hotplug(CpuState& c, int keep_groups_encoded) {
+static void apply_hotplug(CpuState& c, int keep_p, int keep_e) {
     if (c.core_groups.empty()) return;
 
     if (c.hotplug_settle > 0) { c.hotplug_settle--; return; }
 
     int total = (int)c.core_groups.size();
-    int raw = keep_groups_encoded;
-    bool gpu_heavy = (raw < 0);
-    int target = (raw == 0) ? total : std::abs(raw);
-    target = std::max(target, 1);
-    if (raw == c.keep_groups_target) return;
 
-    int current = count_online_groups(c);
+    // Count P and E groups
+    int p_count = 0, e_count = 0;
+    for (auto& g : c.core_groups) {
+        if (g.is_pcore) p_count++; else e_count++;
+    }
 
-    // Build a "should_online" mask for each group:
-    // Groups are sorted by priority descending.  P-cores have higher priority.
-    // CPU0's group is always online (safety floor).
+    // Convention: {0,0} → keep all online (safety floor / saturated).
+    // If only one type is 0, it means "keep 0 of that type" (offlined).
+    if (keep_p == 0 && keep_e == 0) {
+        keep_p = p_count;
+        keep_e = e_count;
+    }
+
+    // Check if state has changed
+    int cur_p = 0, cur_e = 0;
+    for (int i = 0; i < total; ++i) {
+        bool online = false;
+        for (int cp : c.core_groups[i].cpus) {
+            std::string s = sysfs_read_file(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(cp) + "/online");
+            if (s != "0") online = true;
+        }
+        if (online) {
+            if (c.core_groups[i].is_pcore) cur_p++; else cur_e++;
+        }
+    }
+    if (cur_p == keep_p && cur_e == keep_e) return;
+
+    // Build "should_online" mask: pick top N from each type
     std::vector<bool> should_online(total, false);
 
     // 1. CPU0's group always online
@@ -582,41 +601,43 @@ static void apply_hotplug(CpuState& c, int keep_groups_encoded) {
         for (int cp : c.core_groups[i].cpus)
             if (cp == 0) { should_online[i] = true; break; }
 
-    // 2. Fill remaining slots based on mode
-    {
-        int remaining = target - 1;  // -1 for CPU0's group
-        if (gpu_heavy) {
-            // GPU-heavy: keep E-cores first, then P-cores.
-            // Groups are sorted P-first, so fill from the END (E-cores).
-            for (int i = total - 1; i >= 0 && remaining > 0; --i) {
-                if (!should_online[i]) { should_online[i] = true; remaining--; }
-            }
-        } else {
-            // CPU-heavy: keep P-cores first.
-            // Groups are sorted P-first, so fill from the START.
-            for (int i = 0; i < total && remaining > 0; ++i) {
-                if (!should_online[i]) { should_online[i] = true; remaining--; }
-            }
-        }
-    }
+    // 2. Pick top keep_p P-groups (by priority, already sorted P-first)
+    { int p_filled = 0;
+      for (int i = 0; i < total && p_filled < keep_p; ++i) {
+          if (c.core_groups[i].is_pcore) {
+              should_online[i] = true;
+              p_filled++;
+          }
+      } }
 
-    // 3. Ensure at least min_core_groups P-core groups stay online (safety floor)
+    // 3. Pick top keep_e E-groups (by priority, lowest CPU id first)
+    // Groups are sorted P-first, so E-groups come after P-groups.
+    // Within E, higher CPU number = lower priority, so pick from the P-end.
+    { int e_filled = 0;
+      for (int i = 0; i < total && e_filled < keep_e; ++i) {
+          if (!c.core_groups[i].is_pcore) {
+              should_online[i] = true;
+              e_filled++;
+          }
+      } }
+
+    // 4. Ensure at least min_core_groups P-core groups stay online
     {
-        int p_would_stay = 0;
+        int p_staying = 0;
         for (int i = 0; i < total; ++i)
-            if (should_online[i] && c.core_groups[i].is_pcore) p_would_stay++;
-        if (p_would_stay < default_resource_config.min_core_groups) {
+            if (should_online[i] && c.core_groups[i].is_pcore) p_staying++;
+        if (p_staying < default_resource_config.min_core_groups) {
             for (int i = 0; i < total; ++i) {
                 if (!should_online[i] && c.core_groups[i].is_pcore) {
                     should_online[i] = true;
-                    p_would_stay++;
-                    if (p_would_stay >= default_resource_config.min_core_groups) break;
+                    p_staying++;
+                    if (p_staying >= default_resource_config.min_core_groups) break;
                 }
             }
         }
     }
 
-    // Apply: offline groups marked offline, online groups marked online
+    // Apply
     bool changed = false;
     for (int i = 0; i < total; ++i) {
         auto& g = c.core_groups[i];
@@ -637,10 +658,16 @@ static void apply_hotplug(CpuState& c, int keep_groups_encoded) {
 
     if (changed) {
         int new_count = count_online_groups(c);
-        syslog(LOG_INFO, "hotplug: %d groups online (target=%d, keep=%d, mode=%s)",
-               new_count, target, current, gpu_heavy ? "gpu" : "cpu");
-        c.keep_groups_target = raw;
-        c.hotplug_settle = 6;  // 1.2s cooldown (6 * 200ms) after hotplug transition
+        int new_p = 0, new_e = 0;
+        for (int i = 0; i < total; ++i) {
+            std::string s = sysfs_read_file(std::string(SYSFS_CPU_BASE) + "/cpu" + std::to_string(c.core_groups[i].cpus[0]) + "/online");
+            if (s != "0") {
+                if (c.core_groups[i].is_pcore) new_p++; else new_e++;
+            }
+        }
+        syslog(LOG_INFO, "hotplug: %d groups online (P=%d E=%d, target=P=%d E=%d, prev=P=%d E=%d)",
+               new_count, new_p, new_e, keep_p, keep_e, cur_p, cur_e);
+        c.hotplug_settle = 6;
     }
 }
 
@@ -1105,15 +1132,13 @@ int main(int argc, char** argv) {
         printf("  gpu_headroom:    %.1fW\n", res.gpu_headroom_w);
         double cpu_draw = res_inputs.cpu_measured_w > 0 ? res_inputs.cpu_measured_w : res.cpu_target_w;
         double budget_ratio = (cpu_draw > 0) ? res.cpu_target_w / cpu_draw : 0;
-        printf("  budget_ratio:    %.2f (target/draw, >1.5→P-only, 0.8-1.5→scale E, <0.8→aggressive)\n", budget_ratio);
+        printf("  budget_ratio:    %.2f\n", budget_ratio);
         printf("  max_perf_pct:    %d%%\n", res.max_perf_pct);
         printf("  no_turbo:        %s\n", res.no_turbo ? "ON" : "OFF");
         printf("  epp_p:           %s\n", epp_to_string(res.epp_p));
         printf("  epp_e:           %s\n", epp_to_string(res.epp_e));
-        printf("  keep_groups:     %d (%s, mode=%s)\n",
-               res.keep_groups,
-               res.keep_groups == 0 ? "all online" : "keep |N|",
-               res.keep_groups < 0 ? "gpu-first" : "cpu-first");
+        printf("  keep_p:          %d (%s)\n", res.keep_p, res.keep_p == 0 ? "all P" : "keep this many P");
+        printf("  keep_e:          %d (%s)\n", res.keep_e, res.keep_e == 0 ? "all E" : "keep this many E");
         printf("  demand_factor:   %.2f\n", res.demand_factor);
         printf("  aggression:      %d (%s)\n",
                res.aggression,
@@ -1291,7 +1316,8 @@ int main(int argc, char** argv) {
     int prev_max_perf = 100;       // previous max_perf_pct (for smoothing across cycles)
     EppLevel prev_epp_p = EppLevel::BalancePerformance;  // prev EPP (for hysteresis)
     EppLevel prev_epp_e = EppLevel::BalancePerformance;
-    int prev_keep_groups = 0;                             // prev hotplug target (hysteresis)
+    int prev_keep_p = 0;  // prev P-core target (for hysteresis)
+    int prev_keep_e = 0;  // prev E-core target (for hysteresis)
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(INTERVAL_MS));
@@ -1368,7 +1394,8 @@ int main(int argc, char** argv) {
         res_inputs.prev_max_perf    = prev_max_perf;
         res_inputs.prev_epp_p       = prev_epp_p;
         res_inputs.prev_epp_e       = prev_epp_e;
-        res_inputs.prev_keep_groups = prev_keep_groups;
+        res_inputs.prev_keep_p = prev_keep_p;
+        res_inputs.prev_keep_e = prev_keep_e;
 
         ResourceResult res = solve_resources(res_inputs, res_cfg);
 
@@ -1386,10 +1413,10 @@ int main(int argc, char** argv) {
                    sched.effective_demand, (int)s.cpu.core_groups.size(),
                    sched.running_tasks);
             syslog(LOG_DEBUG, "OPT-RESULT: cpu_target=%.1fW effective=%.1fW gpu_headroom=%.1fW "
-                   "demand_factor=%.2f keep_groups=%d "
+                   "demand_factor=%.2f keep_p=%d keep_e=%d "
                    "core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s epp_e=%s",
                    res.cpu_target_w, res.effective_cpu_w(), res.gpu_headroom_w,
-                   res.demand_factor, res.keep_groups,
+                   res.demand_factor, res.keep_p, res.keep_e,
                    res.core_limit_w, res.max_perf_pct, res.no_turbo,
                    epp_to_string(res.epp_p), epp_to_string(res.epp_e));
         }
@@ -1438,9 +1465,15 @@ int main(int argc, char** argv) {
             }
         }
         { // min_perf_pct
-            int abs_keep = std::abs(res.keep_groups);
-            int min_perf = (abs_keep > 0 && abs_keep < (int)s.cpu.core_groups.size())
-                           ? 0 : s.saved.min_perf;
+            // If any cores are offlined (keep_p or keep_e > 0 and < total of that type),
+            // set min_perf to 0 to allow downclocking.
+            int p_total = 0, e_total = 0;
+            for (auto& g : s.cpu.core_groups) {
+                if (g.is_pcore) p_total++; else e_total++;
+            }
+            bool p_offlined = (res.keep_p > 0 && res.keep_p < p_total);
+            bool e_offlined = (res.keep_e > 0 && res.keep_e < e_total);
+            int min_perf = (p_offlined || e_offlined) ? 0 : s.saved.min_perf;
             int cur = 0;
             if (!sysfs_read_attr(SYSFS_PSTATE_DIR, "min_perf_pct", cur) || cur != min_perf) {
                 if (!sysfs_write_int(SYSFS_PSTATE_MIN, min_perf))
@@ -1452,7 +1485,7 @@ int main(int argc, char** argv) {
         cpu_set_epp(s.cpu, epp_to_string(res.epp_p), epp_to_string(res.epp_e));
 
         // ── CPU hotplug (core offlining) ──
-        apply_hotplug(s.cpu, res.keep_groups);
+        apply_hotplug(s.cpu, res.keep_p, res.keep_e);
 
         // ── GT0 power profile ──
         // Active GPU → "base" profile (full performance).
@@ -1512,12 +1545,11 @@ int main(int argc, char** argv) {
                          res.demand_factor);
             }
             syslog(LOG_INFO, "[%s] pkg=%.1fW core=%.1fW gpu=%.1fW(gpu_sm=%.1fW) "
-                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s%s kp_grp=%d(%s)",
+                   "pl1=%.1fW core_lmt=%.1fW max_perf=%d%% no_turbo=%d epp=%s%s%s%s%s kp_P=%d kp_E=%d",
                    state, pkg_w, core_w, gpu_w, smoothed_gpu_w,
                    pl1_w, res.core_limit_w, res.max_perf_pct, res.no_turbo, epp_str.c_str(),
                    temp_buf, res_buf, throttle_summary.c_str(), c0_buf,
-                   res.keep_groups,
-                   res.keep_groups < 0 ? (core_w < 3.0 ? "idle" : "gpu") : "cpu");
+                   res.keep_p, res.keep_e);
             last_aggression = aggression;
         }
 
@@ -1525,7 +1557,8 @@ int main(int argc, char** argv) {
         prev_max_perf = res.max_perf_pct;
         prev_epp_p = res.epp_p;
         prev_epp_e = res.epp_e;
-        prev_keep_groups = res.keep_groups;
+        prev_keep_p = res.keep_p;
+        prev_keep_e = res.keep_e;
     }
 
     // ── Report final throttle statistics ──
