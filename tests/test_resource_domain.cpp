@@ -242,12 +242,12 @@ TEST(SolveResources, HighBudgetPonly) {
     EXPECT_EQ(result.keep_groups, 6);
 }
 
-TEST(SolveResources, ModerateBudgetScalesECores) {
+TEST(SolveResources, GpuHeavyShedsPCores) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 15.0;   // GPU active
+    inputs.gpu_power_w = 15.0;   // GPU heavy → gpu_heavy mode
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.05;    // CPU idle → demand_factor = 0.525
@@ -259,14 +259,46 @@ TEST(SolveResources, ModerateBudgetScalesECores) {
 
     auto result = solve_resources(inputs, cfg);
 
+    // GPU-heavy: gpu_power>3 && demand<0.5 → mode = gpu (negative)
     // budget = (40-15-3) * 0.525 = 12.6W, ratio = 12.6/10.0 = 1.26
-    // 0.8 < ratio < 1.5 → scale E-cores: e_frac = (1.26-0.8)/0.7 ≈ 0.66
-    // target = 6 + 10*0.66 ≈ 12 (more than P-only, less than all)
-    EXPECT_GT(result.keep_groups, 6);
+    // GPU-heavy moderate: p_fraction = (1.26-0.8)/0.7 ≈ 0.66
+    // p_keep = 1 + (6-1)*0.66 ≈ 4, target = 4 + 10 = 14
+    // encoded as negative: -14
+    EXPECT_LT(result.keep_groups, 0);  // GPU-heavy mode
+    int abs_keep = std::abs(result.keep_groups);
+    EXPECT_GT(abs_keep, 10);  // all E-cores + some P-cores
+    EXPECT_LT(abs_keep, 16);
+}
+
+TEST(SolveResources, CpuHeavyShedsECores) {
+    ResourceConfig cfg;
+    cfg.min_core_groups = 1;
+    ResourceInputs inputs{};
+    inputs.pl1_w = 40.0;
+    inputs.gpu_power_w = 1.0;    // GPU idle → cpu_heavy mode
+    inputs.have_gpu = true;
+    inputs.temp_c = 50.0;
+    inputs.cpu_demand = 0.80;    // CPU heavy → demand_factor = 0.9
+    inputs.gpu_c0_pct = 0.0;
+    inputs.gpu_power_var_w = 0.0;
+    inputs.cpu_measured_w = 25.0;  // 25W CPU draw
+    inputs.total_core_groups = 16;
+    inputs.pcore_count = 6;
+
+    auto result = solve_resources(inputs, cfg);
+
+    // CPU-heavy: gpu_power<=3 || demand>=0.5 → mode = cpu (positive)
+    // budget = (40-1-1) * 0.9 = 34.2W, ratio = 34.2/25.0 = 1.37
+    // CPU-heavy moderate: e_frac = (1.37-0.8)/0.7 ≈ 0.81
+    // target = 6 + 10*0.81 ≈ 14
+    // demand>0.75: target = max(14, 14) = 14
+    // encoded as positive: 14
+    EXPECT_GT(result.keep_groups, 0);  // CPU-heavy mode
+    EXPECT_GT(result.keep_groups, 6);  // P-cores + some E-cores
     EXPECT_LT(result.keep_groups, 16);
 }
 
-TEST(SolveResources, TightBudgetAggressiveScaling) {
+TEST(SolveResources, TightBudgetGpuHeavy) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
@@ -274,20 +306,23 @@ TEST(SolveResources, TightBudgetAggressiveScaling) {
     inputs.gpu_power_w = 20.0;   // GPU heavy
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.10;    // low CPU demand → demand_factor = 0.55
+    inputs.cpu_demand = 0.10;    // low CPU demand
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
-    inputs.cpu_measured_w = 15.0;  // 15W CPU draw
+    inputs.cpu_measured_w = 15.0;
     inputs.total_core_groups = 16;
     inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // headroom = 1.5*0 + max(1, 20*0.25) = 5.0
+    // headroom = max(1, 20*0.25) = 5.0
     // budget = (40-20-5) * 0.55 = 7.58W, ratio = 7.58/15.0 = 0.51
-    // ratio < 0.8 → target = max(1, floor(16*0.51)) = 8
-    EXPECT_GT(result.keep_groups, 1);
-    EXPECT_LT(result.keep_groups, 10);
+    // GPU-heavy tight: target = max(1+10, floor(16*0.51)) = max(11, 8) = 11
+    // encoded as negative: -11
+    EXPECT_LT(result.keep_groups, 0);  // GPU-heavy mode
+    int abs_keep = std::abs(result.keep_groups);
+    EXPECT_GE(abs_keep, 11);  // at least 1 P + all 10 E
+    EXPECT_LT(abs_keep, 16);
 }
 
 TEST(SolveResources, DemandFloorOverridesBudget) {
@@ -311,14 +346,43 @@ TEST(SolveResources, DemandFloorOverridesBudget) {
     EXPECT_EQ(result.keep_groups, 0);
 }
 
-// ── CPU-only workload (no GPU): P-cores used, E-cores shed ──
+// ── Hotplug smoothing: small changes are suppressed ──
+
+TEST(SolveResources, HotplugSmoothingSuppressesSmallChange) {
+    ResourceConfig cfg;
+    cfg.min_core_groups = 1;
+    ResourceInputs inputs{};
+    inputs.pl1_w = 40.0;
+    inputs.gpu_power_w = 20.0;   // GPU active → gpu_heavy mode
+    inputs.have_gpu = true;
+    inputs.temp_c = 50.0;
+    inputs.cpu_demand = 0.20;
+    inputs.gpu_c0_pct = 0.0;
+    inputs.gpu_power_var_w = 2.0;
+    inputs.cpu_measured_w = 15.0;  // 15W CPU draw
+    inputs.total_core_groups = 16;
+    inputs.pcore_count = 6;
+
+    auto result = solve_resources(inputs, cfg);
+
+    // Solver computes some target (negative = gpu_heavy); smoothing keeps prev if within 1
+    inputs.prev_keep_groups = result.keep_groups;
+    auto result2 = solve_resources(inputs, cfg);
+    EXPECT_EQ(result2.keep_groups, result.keep_groups);  // prev preserved
+
+    // Different prev within 1 → keep prev
+    int prev_abs = std::abs(result.keep_groups);
+    inputs.prev_keep_groups = result.keep_groups < 0 ? -(prev_abs - 1) : prev_abs - 1;
+    auto result3 = solve_resources(inputs, cfg);
+    EXPECT_EQ(result3.keep_groups, inputs.prev_keep_groups);  // within 1 → keep prev
+}
 
 TEST(SolveResources, CpuOnlyShedsECores) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 0.0;   // no GPU
+    inputs.gpu_power_w = 0.0;   // no GPU → cpu_heavy mode
     inputs.have_gpu = false;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.80;   // CPU heavily loaded (LLM inference)
@@ -330,43 +394,11 @@ TEST(SolveResources, CpuOnlyShedsECores) {
 
     auto result = solve_resources(inputs, cfg);
 
-    // No GPU → full budget → ratio ≈ 40/20 = 2.0 → clamped to 2.0
-    // ratio > 1.5 → P-cores only = 6. Demand > 0.75 → max(6, total-2=14) = 14
-    // Demand floor raises target to 14 (P-cores + some E-cores)
+    // No GPU → cpu_heavy mode (positive)
+    // demand > 0.75 → safety floor raises target to total-2 = 14
+    EXPECT_GT(result.keep_groups, 0);  // CPU-heavy mode (positive)
     EXPECT_GT(result.keep_groups, 6);   // demand floor lifts above P-only
     EXPECT_LE(result.keep_groups, 14);
-}
-
-// ── Hotplug smoothing: small changes are suppressed ──
-
-TEST(SolveResources, HotplugSmoothingSuppressesSmallChange) {
-    ResourceConfig cfg;
-    cfg.min_core_groups = 1;
-    ResourceInputs inputs{};
-    inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 20.0;   // GPU active → moderate budget
-    inputs.have_gpu = true;
-    inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.20;
-    inputs.gpu_c0_pct = 0.0;
-    inputs.gpu_power_var_w = 2.0;
-    inputs.cpu_measured_w = 15.0;  // 15W CPU draw
-    inputs.total_core_groups = 16;
-    inputs.pcore_count = 6;
-
-    // ratio ≈ (40-20-3)/15 = 0.87 → 0.8 < ratio < 1.5 → e_frac = 0.87/0.7 = 1.0 → capped
-    // target ≈ 6 + 10 = 16 → clamped to 16 → smoothing kicks in
-    auto result = solve_resources(inputs, cfg);
-
-    // Solver computes some target; smoothing keeps prev if within 1
-    inputs.prev_keep_groups = result.keep_groups;
-    auto result2 = solve_resources(inputs, cfg);
-    EXPECT_EQ(result2.keep_groups, result.keep_groups);  // prev preserved
-
-    // Different prev within 1 → keep prev
-    inputs.prev_keep_groups = std::max(1, result.keep_groups - 1);
-    auto result3 = solve_resources(inputs, cfg);
-    EXPECT_EQ(result3.keep_groups, inputs.prev_keep_groups);  // within 1 → keep prev
 }
 
 // ═══════════════════════════════════════════════════════════

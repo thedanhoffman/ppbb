@@ -95,7 +95,10 @@ struct ResourceResult {
     EppLevel epp_e          = EppLevel::BalancePerformance;  // E-core EPP
 
     // CPU topology (hotplug)
-    int    keep_groups      = 0;    // core groups to keep online (0 = keep all)
+    int    keep_groups      = 0;    // core groups to keep online
+                                            // >0: keep first N groups (P-first, CPU-heavy)
+                                            // <0: keep |N| groups, E-first (GPU-heavy)
+                                            // =0: keep all online
 
     // Diagnostics
     double thermal_surrender = 0.0; // UNUSED — thermal surrender disabled (always 0.0)

@@ -169,77 +169,96 @@ static bool choose_turbo(double cpu_measured_w,
 // current state to avoid ping-pong.  The offline threshold is higher than the
 // online threshold (gpu_active_thresh > gpu_idle_thresh), creating a dead band.
 //
-// Budget-driven hotplug: map CPU power budget to core count.
-// GPU activity is implicit: GPU power draw is already subtracted from cpu_budget
-// (via gpu_headroom).  The budget/draw ratio tells us how much excess we have.
-// P-cores are always preferred over E-cores (apply_hotplug keeps first `target` groups).
+// Budget-driven hotplug with mode-aware core selection.
+// Two modes determined by workload character:
 //
-// Policy:
-//   ratio > 1.5 → plenty of headroom → keep P-cores only (always shed E leakage)
-//   ratio 0.8-1.5 → scale E-cores proportionally
-//   ratio < 0.8  → budget tight → scale all cores aggressively
-//   demand floors act as safety nets (never drop below what scheduler needs)
-static int choose_keep_groups(double cpu_budget, double cpu_power_ref,
+//   GPU-heavy (gpu_power > 3W && cpu_demand < 0.5):
+//     Package power is consumed by GPU; CPU is idle.
+//     Shed P-cores first (they leak more), keep E-cores.
+//     Return negative count (apply_hotplug keeps last |N| = E-first + CPU0).
+//
+//   CPU-heavy (default):
+//     CPU threads need speed; GPU is background.
+//     Shed E-cores first (P-cores deliver performance).
+//     Return positive count (apply_hotplug keeps first N = P-first).
+//
+// Return 0 = keep all online.
+static int choose_keep_groups(double cpu_budget, double cpu_draw,
                                int total_groups, int pcore_count,
-                               double cpu_demand, int running_tasks,
-                               int prev_keep_groups) {
+                               double cpu_demand, double gpu_power_w,
+                               int running_tasks, int prev_keep_groups) {
     // ── Safety floors ──
-
-    // Runnable tasks: if system is oversubscribed, keep all online.
     if (running_tasks > 0 && total_groups > 0) {
-        int threshold = (total_groups * 80) / 100;  // 80%
+        int threshold = (total_groups * 80) / 100;
         if (running_tasks >= threshold) return 0;
     }
-
-    // Saturated demand: keep all online (CPU is the bottleneck).
     if (cpu_demand >= 0.95) return 0;
 
-    // ── Budget-vs-draw core mapping ──
-    double ratio = (cpu_power_ref > 0) ? cpu_budget / cpu_power_ref : 1.0;
+    // ── Determine mode ──
     int ecore_count = total_groups - pcore_count;
+    bool gpu_heavy = (gpu_power_w > 3.0 && cpu_demand < 0.5);
 
-    // Clamp ratio to [0.1, 2.0] to avoid wild swings
+    // ── Budget-vs-draw ratio ──
+    double ratio = (cpu_draw > 0) ? cpu_budget / cpu_draw : 1.0;
     ratio = std::max(0.1, std::min(2.0, ratio));
 
     int target;
-    if (ratio > 1.5) {
-        // Ample budget: keep P-cores only, always shed E-core leakage.
-        // Even idle systems don't need E-core leakage burning.
-        target = pcore_count;
-    } else if (ratio > 0.8) {
-        // Moderate headroom: scale E-cores in proportion to excess budget.
-        // At ratio=1.5 → pcore_count + ecore_count (all online)
-        // At ratio=0.8 → pcore_count + 0 (P-only)
-        double e_fraction = (ratio - 0.8) / 0.7;  // 0.0–1.0
-        target = pcore_count + static_cast<int>(ecore_count * e_fraction);
+    if (gpu_heavy) {
+        // ── GPU-heavy mode: shed P-cores, keep E-cores ──
+        // E-cores are always kept; P-cores scaled by budget.
+        // CPU0's group is always online (enforced by apply_hotplug).
+        if (ratio > 1.5) {
+            // Ample budget: keep minimal P + all E (still save P leakage)
+            target = 1 + ecore_count;  // CPU0 group + all E-cores
+        } else if (ratio > 0.8) {
+            // Moderate: scale P-cores in, keep all E
+            double p_fraction = (ratio - 0.8) / 0.7;
+            int p_keep = 1 + static_cast<int>((pcore_count - 1) * p_fraction);
+            target = std::max(1, p_keep) + ecore_count;
+        } else {
+            // Tight: scale total by ratio, but keep at least 1 P + all E
+            target = std::max(1 + ecore_count,
+                               static_cast<int>(total_groups * ratio));
+        }
     } else {
-        // Tight budget: scale all cores by ratio, min 1.
-        target = std::max(1, static_cast<int>(total_groups * ratio));
+        // ── CPU-heavy mode: shed E-cores, keep P-cores ──
+        if (ratio > 1.5) {
+            // Ample budget: keep P-cores only (always shed E leakage)
+            target = pcore_count;
+        } else if (ratio > 0.8) {
+            // Moderate: scale E-cores in proportion to excess budget
+            double e_fraction = (ratio - 0.8) / 0.7;
+            target = pcore_count + static_cast<int>(ecore_count * e_fraction);
+        } else {
+            // Tight: scale all cores by ratio
+            target = std::max(1, static_cast<int>(total_groups * ratio));
+        }
     }
 
     // ── Demand safety floors ──
-    // Scheduler demand acts as a minimum — never drop below what the
-    // scheduler says is needed.  Budget decides the ceiling; demand is the floor.
     if (cpu_demand > 0.75) {
         target = std::max(target, total_groups - 2);
     } else if (cpu_demand > 0.4) {
         target = std::max(target, total_groups / 2);
-    } else if (cpu_demand > 0.15) {
+    } else if (cpu_demand > 0.15 && !gpu_heavy) {
         target = std::max(target, pcore_count);
     }
 
-    // Clamp to valid range
     target = std::max(1, std::min(target, total_groups));
 
-    // ── Smoothing: prefer previous value if close ──
-    // Prevents rapid online/offline transitions near decision boundaries.
-    if (prev_keep_groups > 0 && target > 0) {
-        if (std::abs(target - prev_keep_groups) <= 1) {
-            target = prev_keep_groups;
+    // ── Encode mode as sign ──
+    int encoded = gpu_heavy ? -target : target;
+
+    // ── Smoothing: prefer previous if close (compare absolute values) ──
+    int prev_abs = std::abs(prev_keep_groups);
+    int cur_abs = std::abs(encoded);
+    if (prev_abs > 0 && cur_abs > 0) {
+        if (std::abs(cur_abs - prev_abs) <= 1) {
+            encoded = prev_keep_groups;
         }
     }
 
-    return target;
+    return encoded;
 }
 
 // Aggression level from GPU throttle state and demand.
@@ -365,19 +384,22 @@ ResourceResult solve_resources(const ResourceInputs& inputs,
     // Pass actual measured CPU power (not theoretical capacity) so the
     // budget/draw ratio reflects real utilization, not theoretical limits.
     // Falls back to cpu_power_ref (capacity) if no measurement available.
+    // gpu_power_w determines hotplug mode (GPU-heavy vs CPU-heavy).
     double cpu_draw = (inputs.cpu_measured_w > 0) ? inputs.cpu_measured_w : cpu_power_ref;
     int keep_groups = choose_keep_groups(
         cpu_budget, cpu_draw, inputs.total_core_groups,
-        inputs.pcore_count, inputs.cpu_demand,
+        inputs.pcore_count, inputs.cpu_demand, inputs.gpu_power_w,
         inputs.running_tasks, inputs.prev_keep_groups);
 
-    // Don't clamp 0 (keep all) — that's the most conservative policy.
-    if (keep_groups > 0) {
-        keep_groups = std::max(keep_groups, config.min_core_groups);
+    // Clamp absolute value against min_core_groups (sign encodes mode)
+    int abs_keep = std::abs(keep_groups);
+    if (abs_keep > 0) {
+        abs_keep = std::max(abs_keep, config.min_core_groups);
     }
-    if (keep_groups > inputs.total_core_groups) {
-        keep_groups = 0;  // not enough groups to offline
+    if (abs_keep > inputs.total_core_groups) {
+        abs_keep = 0;  // not enough groups to offline
     }
+    keep_groups = (keep_groups < 0) ? -abs_keep : abs_keep;
 
     result.keep_groups = keep_groups;
 
