@@ -216,13 +216,13 @@ TEST(SolveResources, DomainMaxLimit) {
 
 // ── GPU-idle hotplug: when GPU is not competing, keep all cores online ──
 
-// ── Continuous hotplug: w=sigmoid(gpu_heaviness), per-type keep counts ──
+// ── Conservative continuous hotplug: sigmoid weight + EMA demand ──
 // pcore_count=6, total=16 → 10 E-core groups.
-// gpu_heaviness = gpu_power / (cpu_draw + 1.0)
-// w = sigmoid(gpu_heaviness, center=2.0, slope=3.0)
-// 0 = keep_p/keep_e = 0 means "keep all of that type"
+// Budget ratio → sqrt scaling (capped at 70% slots)
+// Demand deadband at 0.5 (smoothed), max 50% total slots without demand>0.7
+// smoothed_demand defaults to 1.0 if not set (saturated = all online)
 
-TEST(SolveResources, IdlePreferECores) {
+TEST(SolveResources, IdleMinimalCores) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
@@ -231,6 +231,7 @@ TEST(SolveResources, IdlePreferECores) {
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.05;
+    inputs.smoothed_demand = 0.1;  // sustained idle
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
     inputs.cpu_measured_w = 5.0;
@@ -239,14 +240,15 @@ TEST(SolveResources, IdlePreferECores) {
 
     auto result = solve_resources(inputs, cfg);
 
-    // gpu_heaviness = 1.0/6.0 = 0.17 → w ≈ 0.003 (near 0 = P-first)
-    // P-cores preferred, E-cores shed
-    EXPECT_GT(result.keep_p, 0);  // some P-cores kept
-    EXPECT_LE(result.keep_e, 3);  // few E-cores
-    EXPECT_LE(result.keep_p + result.keep_e, 10);
+    // Conservative: idle → minimal cores (1-3 total)
+    // w_idle=0.26 (cpu_draw=5), w_gpu=0.003, w=0.16 → P-slots=5, E-slots=2
+    // sqrt(0.5*2.0)=0.70, capped to 70% → target≈5 of 7 slots
+    // max 50% cap (demand<0.7): keep≤8 total → after capping: minimal
+    EXPECT_LE(result.keep_p + result.keep_e, 6);
+    EXPECT_GT(result.keep_p, 0);  // CPU0 always online
 }
 
-TEST(SolveResources, GpuHeavyPreferECores) {
+TEST(SolveResources, GpuHeavyMinimalCpu) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
@@ -255,28 +257,32 @@ TEST(SolveResources, GpuHeavyPreferECores) {
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.05;
+    inputs.smoothed_demand = 0.1;  // sustained low
     inputs.gpu_c0_pct = 0.0;
-    inputs.gpu_power_var_w = 0.5;  // low variance → low headroom
-    inputs.cpu_measured_w = 3.0;   // low CPU draw
+    inputs.gpu_power_var_w = 0.5;
+    inputs.cpu_measured_w = 3.0;
     inputs.total_core_groups = 16;
     inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // gpu_heaviness = 20/4 = 5.0 → w ≈ 0.99 (near E-first)
-    // E-cores get more slots than P-cores
+    // GPU heavy → w=0.6*0.31+0.4*0.99=0.58 → P-slots=3, E-slots=5
+    // Conservative: minimal CPU cores during GPU workload
+    // max 50% cap (8 slots) since demand<0.7
     EXPECT_GT(result.keep_e, result.keep_p);
+    EXPECT_LE(result.keep_p, 2);  // at most 1-2 P-cores
 }
 
-TEST(SolveResources, CpuHeavyPreferPCores) {
+TEST(SolveResources, CpuHeavyBringPCoresOnline) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 1.0;    // GPU idle
+    inputs.gpu_power_w = 1.0;
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.80;
+    inputs.smoothed_demand = 0.75;  // sustained heavy
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
     inputs.cpu_measured_w = 25.0;
@@ -285,37 +291,37 @@ TEST(SolveResources, CpuHeavyPreferPCores) {
 
     auto result = solve_resources(inputs, cfg);
 
-    // gpu_heaviness = 1/26 = 0.04 → w ≈ 0.0 (near P-first)
-    // P-cores strongly preferred
+    // High smoothed_demand → w≈0 (P-first), demand boost=1.15
+    // demand>0.7 so max 50% cap doesn't apply
+    // P-cores strongly preferred with boost
     EXPECT_GT(result.keep_p, 0);
-    EXPECT_LE(result.keep_e, result.keep_p);
+    EXPECT_GT(result.keep_p, result.keep_e);
 }
 
-TEST(SolveResources, BalancedBlendsPCoresAndECores) {
+TEST(SolveResources, BalancedConservative) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 15.0;   // moderate GPU
+    inputs.gpu_power_w = 15.0;
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.30;
+    inputs.smoothed_demand = 0.25;  // sustained moderate
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 1.0;
-    inputs.cpu_measured_w = 3.0;   // moderate CPU draw
+    inputs.cpu_measured_w = 3.0;
     inputs.total_core_groups = 16;
     inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // gpu_heaviness = 15/4 = 3.75 → w_gpu ≈ 0.77
-    // cpu_draw=3W → w_idle ≈ 0.50
-    // w = 0.5*0.50 + 0.5*0.77 ≈ 0.64 (moderate E preference)
-    // Both P and E get meaningful slots
+    // Moderate GPU → w=0.6*0.27+0.4*0.77=0.47 → blended
+    // max 50% cap (demand<0.7): keep≤8 total
+    // Both P and E get slots but conservative total
     EXPECT_GT(result.keep_p, 0);
     EXPECT_GT(result.keep_e, 0);
-    // E-cores get more slots than P-cores at this blend
-    EXPECT_GT(result.keep_e, 3);
+    EXPECT_LE(result.keep_p + result.keep_e, 8);
 }
 
 TEST(SolveResources, DemandSaturatedAllOnline) {
@@ -327,6 +333,7 @@ TEST(SolveResources, DemandSaturatedAllOnline) {
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.98;
+    inputs.smoothed_demand = 0.98;  // sustained saturation
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
     inputs.cpu_measured_w = 20.0;
@@ -335,7 +342,7 @@ TEST(SolveResources, DemandSaturatedAllOnline) {
 
     auto result = solve_resources(inputs, cfg);
 
-    // demand > 0.95 → keep all online
+    // smoothed_demand > 0.95 → all online
     EXPECT_EQ(result.keep_p, 0);
     EXPECT_EQ(result.keep_e, 0);
 }
@@ -349,6 +356,7 @@ TEST(SolveResources, HotplugSmoothingPerType) {
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.20;
+    inputs.smoothed_demand = 0.20;
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 2.0;
     inputs.cpu_measured_w = 15.0;
@@ -375,7 +383,7 @@ TEST(SolveResources, HotplugSmoothingPerType) {
     EXPECT_EQ(result4.keep_p, result.keep_p);  // beyond 2 → use new value
 }
 
-TEST(SolveResources, CpuOnlyHighDemand) {
+TEST(SolveResources, CpuOnlySustainedHeavy) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
@@ -384,6 +392,7 @@ TEST(SolveResources, CpuOnlyHighDemand) {
     inputs.have_gpu = false;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.80;
+    inputs.smoothed_demand = 0.75;  // sustained heavy
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
     inputs.cpu_measured_w = 20.0;
@@ -392,10 +401,9 @@ TEST(SolveResources, CpuOnlyHighDemand) {
 
     auto result = solve_resources(inputs, cfg);
 
-    // No GPU → gpu_heaviness=0 → w≈0 → P-first
-    // High demand → demand boost raises counts
+    // No GPU → w≈0 (P-first), sustained demand → boost
     EXPECT_GT(result.keep_p, 0);
-    EXPECT_LE(result.keep_e, result.keep_p);
+    EXPECT_GT(result.keep_p, result.keep_e);
 }
 
 TEST(SolveResources, DemandDeadbandIgnoresSmallBumps) {
@@ -406,7 +414,8 @@ TEST(SolveResources, DemandDeadbandIgnoresSmallBumps) {
     inputs.gpu_power_w = 0.0;
     inputs.have_gpu = false;
     inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.15;   // small bump — below deadband of 0.3
+    inputs.cpu_demand = 0.15;
+    inputs.smoothed_demand = 0.15;  // below deadband of 0.5
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
     inputs.cpu_measured_w = 5.0;
@@ -415,15 +424,15 @@ TEST(SolveResources, DemandDeadbandIgnoresSmallBumps) {
 
     auto result_low = solve_resources(inputs, cfg);
 
-    inputs.cpu_demand = 0.25;   // still below deadband
+    inputs.smoothed_demand = 0.35;  // still below deadband of 0.5
     auto result_high = solve_resources(inputs, cfg);
 
-    // Small demand bumps should not change hotplug target
+    // Small bumps should not change hotplug target
     EXPECT_EQ(result_low.keep_p, result_high.keep_p);
     EXPECT_EQ(result_low.keep_e, result_high.keep_e);
 
-    // But demand > 0.3 should raise counts
-    inputs.cpu_demand = 0.60;
+    // But smoothed_demand > 0.5 should raise counts
+    inputs.smoothed_demand = 0.70;
     auto result_beyond = solve_resources(inputs, cfg);
     EXPECT_GE(result_beyond.keep_p + result_beyond.keep_e,
               result_low.keep_p + result_low.keep_e);

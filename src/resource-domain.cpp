@@ -188,6 +188,7 @@ struct KeepPE { int keep_p; int keep_e; };
 static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
                                   int total_groups, int pcore_count,
                                   double cpu_demand, double gpu_power_w,
+                                  double smoothed_demand,
                                   int running_tasks,
                                   int prev_keep_p, int prev_keep_e) {
     // ── Safety floors ──
@@ -195,26 +196,29 @@ static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
         int threshold = (total_groups * 80) / 100;
         if (running_tasks >= threshold) return {0, 0};  // all online
     }
-    if (cpu_demand >= 0.95) return {0, 0};  // all online
+    if (smoothed_demand >= 0.95) return {0, 0};  // all online (sustained saturation)
 
     int ecore_count = total_groups - pcore_count;
     if (ecore_count < 1) ecore_count = 1;  // avoid div-by-zero
     if (pcore_count < 1) pcore_count = 1;
 
-    // ── Continuous weight: blend GPU heaviness + idle tendency ──
+    // ── Continuous weight: blend 3 signals → E-core preference ──
     //
     // GPU heaviness: high gpu / low cpu → prefer E (save P leakage)
     double gpu_heaviness = gpu_power_w / (cpu_draw + 1.0);
     double w_gpu = 1.0 / (1.0 + std::exp(-3.0 * (gpu_heaviness - 2.0)));
 
-    // Idle tendency: when cpu_draw is low, there's not enough CPU work
-    // to justify keeping leaky P-cores online. E-cores handle idle efficiently.
-    // Sigmoid: cpu_draw=0→1.0, cpu_draw=3→0.5, cpu_draw=7→0.0
-    double w_idle = 1.0 / (1.0 + std::exp(2.0 * (cpu_draw - 3.0)));
+    // Idle tendency: low cpu_draw → prefer E (P-cores leak at idle)
+    // cpu_draw=0→0.98, cpu_draw=1.5→0.5, cpu_draw=3→0.12
+    double w_idle = 1.0 / (1.0 + std::exp(-4.0 * (1.5 - cpu_draw)));
 
-    // Blend: weight both signals
-    double w = 0.5 * w_idle + 0.5 * w_gpu;
-    // w ∈ [0, 1]: 0 = P-first (CPU-heavy), 1 = E-first (idle/GPU-heavy)
+    // Demand tendency: low demand → prefer E (no work for P-cores)
+    // smoothed_demand=0→1.0, =0.3→0.5, =0.7→0.12
+    double w_demand = 1.0 / (1.0 + std::exp(5.0 * (smoothed_demand - 0.3)));
+
+    // Blend: all three push toward E-cores at idle/GPU-heavy
+    double w = 0.25 * w_idle + 0.35 * w_gpu + 0.40 * w_demand;
+    // w ∈ [0, 1]: 0 = P-first (sustained CPU work), 1 = E-first (idle/GPU-heavy)
 
     // ── Per-type slots from weight ──
     int p_slots = static_cast<int>(std::round(pcore_count * (1.0 - w)));
@@ -228,13 +232,12 @@ static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
     int total_slots = p_slots + e_slots;
 
     // ── Budget ratio → scale total slots ──
+    // sqrt scaling + low cap: budget alone never brings many cores online.
+    // ratio=0.1→fraction=0.15, ratio=1.0→fraction=0.35, ratio=1.5→fraction=0.40
     double ratio = (cpu_draw > 0) ? cpu_budget / cpu_draw : 1.0;
-    ratio = std::max(0.1, std::min(2.0, ratio));
-
-    // Map ratio to fraction: ratio=0.1→0.06 (near-min), ratio=2.0→1.0 (all slots)
-    // Linear: fraction = (ratio - 0.1) / 1.9  → [0, 1]
-    double fraction = (ratio - 0.1) / 1.9;
-    fraction = std::max(0.05, std::min(1.0, fraction));  // always keep at least 5%
+    ratio = std::max(0.1, std::min(1.5, ratio));
+    double fraction = std::sqrt(ratio * 0.25);
+    fraction = std::max(0.1, std::min(0.25, fraction));  // cap at 25% of slots
 
     int target = static_cast<int>(std::round(fraction * total_slots));
     if (target < 1) target = 1;
@@ -248,15 +251,27 @@ static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
         if (w < 0.5) keep_p = 1; else keep_e = 1;
     }
 
-    // ── Demand boost: deadband then smooth increase ──
-    // Ignore small demand bumps (transient spikes) — only bring cores online
-    // when demand is sustained and meaningfully high.
+    // ── Demand boost: deadband at 0.5, slow ramp ──
+    // Only sustained (smoothed) demand > 0.5 brings extra cores.
+    // Ramp is gentle: 1.0 → 1.3 over [0.5, 1.0]
     double demand_boost = 1.0;
-    if (cpu_demand > 0.3) {
-        demand_boost = 1.0 + (cpu_demand - 0.3) * 0.7;  // 1.0 → 1.49 over [0.3, 1.0]
+    if (smoothed_demand > 0.5) {
+        demand_boost = 1.0 + (smoothed_demand - 0.5) * 0.6;  // 1.0 → 1.3
     }
     keep_p = static_cast<int>(std::ceil(keep_p * demand_boost));
     keep_e = static_cast<int>(std::ceil(keep_e * demand_boost));
+
+    // ── Max slot cap: budget alone can't bring many cores online ──
+    // demand<0.5: max 30% total | demand 0.5-0.7: max 50% | demand>0.7: no cap
+    if (smoothed_demand < 0.7) {
+        double pct = (smoothed_demand < 0.5) ? 0.3 : 0.5;
+        int max_slots = std::max(2, static_cast<int>(std::round(total_groups * pct)));
+        if (keep_p + keep_e > max_slots) {
+            double scale = static_cast<double>(max_slots) / (keep_p + keep_e);
+            keep_p = std::max(1, static_cast<int>(std::round(keep_p * scale)));
+            keep_e = std::max(0, max_slots - keep_p);
+        }
+    }
 
     // ── Clamp to valid ranges ──
     keep_p = std::max(0, std::min(keep_p, pcore_count));
@@ -402,6 +417,7 @@ ResourceResult solve_resources(const ResourceInputs& inputs,
     KeepPE keep = choose_keep_groups(
         cpu_budget, cpu_draw, inputs.total_core_groups,
         inputs.pcore_count, inputs.cpu_demand, inputs.gpu_power_w,
+        inputs.smoothed_demand,
         inputs.running_tasks,
         inputs.prev_keep_p, inputs.prev_keep_e);
 

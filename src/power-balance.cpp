@@ -1318,6 +1318,7 @@ int main(int argc, char** argv) {
     EppLevel prev_epp_e = EppLevel::BalancePerformance;
     int prev_keep_p = 0;  // prev P-core target (for hysteresis)
     int prev_keep_e = 0;  // prev E-core target (for hysteresis)
+    double prev_smoothed_demand = 0.0;  // prev smoothed demand (EMA α=0.3)
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(INTERVAL_MS));
@@ -1396,6 +1397,13 @@ int main(int argc, char** argv) {
         res_inputs.prev_epp_e       = prev_epp_e;
         res_inputs.prev_keep_p = prev_keep_p;
         res_inputs.prev_keep_e = prev_keep_e;
+
+        // Smoothed demand: exponential moving average (α=0.3)
+        // Filters instantaneous bumps; only sustained pressure triggers hotplug.
+        // 10 cycles (2s) to reach 95% of new steady state.
+        static constexpr double DEMAND_ALPHA = 0.3;
+        res_inputs.smoothed_demand = DEMAND_ALPHA * sched.effective_demand
+            + (1.0 - DEMAND_ALPHA) * prev_smoothed_demand;
 
         ResourceResult res = solve_resources(res_inputs, res_cfg);
 
@@ -1559,6 +1567,7 @@ int main(int argc, char** argv) {
         prev_epp_e = res.epp_e;
         prev_keep_p = res.keep_p;
         prev_keep_e = res.keep_e;
+        prev_smoothed_demand = res_inputs.smoothed_demand;
     }
 
     // ── Report final throttle statistics ──

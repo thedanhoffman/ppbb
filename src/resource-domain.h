@@ -157,6 +157,10 @@ struct ResourceInputs {
     EppLevel prev_epp_e        = EppLevel::BalancePerformance;
     int     prev_keep_p        = 0;  // previous P-core groups kept (for hysteresis)
     int     prev_keep_e        = 0;  // previous E-core groups kept (for hysteresis)
+
+    // Smoothed demand (exponential moving average of cpu_demand, α=0.3)
+    // Filters out instantaneous bumps; only sustained pressure passes through.
+    double  smoothed_demand    = 1.0;
 };
 
 // ═══════════════════════════════════════════════════════════
