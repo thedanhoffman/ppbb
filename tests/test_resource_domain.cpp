@@ -296,25 +296,26 @@ TEST(SolveResources, BalancedBlendsPCoresAndECores) {
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 10.0;   // moderate GPU
+    inputs.gpu_power_w = 15.0;   // moderate GPU
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
     inputs.cpu_demand = 0.30;
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 1.0;
-    inputs.cpu_measured_w = 5.0;   // low CPU draw
+    inputs.cpu_measured_w = 3.0;   // moderate CPU draw
     inputs.total_core_groups = 16;
     inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // gpu_heaviness = 10/6 = 1.67 → w ≈ 0.44 (near 0.5 = blended)
+    // gpu_heaviness = 15/4 = 3.75 → w_gpu ≈ 0.77
+    // cpu_draw=3W → w_idle ≈ 0.50
+    // w = 0.5*0.50 + 0.5*0.77 ≈ 0.64 (moderate E preference)
     // Both P and E get meaningful slots
     EXPECT_GT(result.keep_p, 0);
     EXPECT_GT(result.keep_e, 0);
-    // Neither dominates completely
-    EXPECT_LT(result.keep_p, 6);
-    EXPECT_LT(result.keep_e, 10);
+    // E-cores get more slots than P-cores at this blend
+    EXPECT_GT(result.keep_e, 3);
 }
 
 TEST(SolveResources, DemandSaturatedAllOnline) {

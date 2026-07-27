@@ -1,0 +1,15 @@
+{
+  "name": "spec-verify-gpu-powercap-thermal",
+  "taskFile": ".ralph/spec-verify-gpu-powercap-thermal.md",
+  "iteration": 1,
+  "maxIterations": 100,
+  "itemsPerIteration": 1,
+  "reflectEvery": 0,
+  "reflectInstructions": "REFLECTION CHECKPOINT\n\nPause and reflect on your progress:\n1. What has been accomplished so far?\n2. What's working well?\n3. What's not working or blocking progress?\n4. Should the approach be adjusted?\n5. What are the next priorities?\n\nUpdate the task file with your reflection, then continue working.",
+  "active": false,
+  "status": "completed",
+  "startedAt": "2026-07-23T14:56:37.458Z",
+  "lastReflectionAt": 0,
+  "ownerSessionId": "019f8ee7-e30d-74a5-a972-3e75c8a90208",
+  "completedAt": "2026-07-23T16:31:17.556Z"
+}

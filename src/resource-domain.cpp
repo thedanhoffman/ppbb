@@ -201,13 +201,20 @@ static KeepPE choose_keep_groups(double cpu_budget, double cpu_draw,
     if (ecore_count < 1) ecore_count = 1;  // avoid div-by-zero
     if (pcore_count < 1) pcore_count = 1;
 
-    // ── Continuous weight: how much to prefer E over P ──
+    // ── Continuous weight: blend GPU heaviness + idle tendency ──
+    //
+    // GPU heaviness: high gpu / low cpu → prefer E (save P leakage)
     double gpu_heaviness = gpu_power_w / (cpu_draw + 1.0);
-    double w = 1.0 / (1.0 + std::exp(-3.0 * (gpu_heaviness - 2.0)));
-    // w ∈ [0, 1]: 0 = P-first, 1 = E-first
-    // At gpu_heaviness=2.0: w=0.5 (equal)
-    // At gpu_heaviness=0:   w≈0.003 (near P-first)
-    // At gpu_heaviness=∞:   w≈1.0 (near E-first)
+    double w_gpu = 1.0 / (1.0 + std::exp(-3.0 * (gpu_heaviness - 2.0)));
+
+    // Idle tendency: when cpu_draw is low, there's not enough CPU work
+    // to justify keeping leaky P-cores online. E-cores handle idle efficiently.
+    // Sigmoid: cpu_draw=0→1.0, cpu_draw=3→0.5, cpu_draw=7→0.0
+    double w_idle = 1.0 / (1.0 + std::exp(2.0 * (cpu_draw - 3.0)));
+
+    // Blend: weight both signals
+    double w = 0.5 * w_idle + 0.5 * w_gpu;
+    // w ∈ [0, 1]: 0 = P-first (CPU-heavy), 1 = E-first (idle/GPU-heavy)
 
     // ── Per-type slots from weight ──
     int p_slots = static_cast<int>(std::round(pcore_count * (1.0 - w)));

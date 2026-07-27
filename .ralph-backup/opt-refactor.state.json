@@ -1,0 +1,15 @@
+{
+  "name": "opt-refactor",
+  "taskFile": ".ralph/opt-refactor.md",
+  "iteration": 1,
+  "maxIterations": 50,
+  "itemsPerIteration": 2,
+  "reflectEvery": 0,
+  "reflectInstructions": "REFLECTION CHECKPOINT\n\nPause and reflect on your progress:\n1. What has been accomplished so far?\n2. What's working well?\n3. What's not working or blocking progress?\n4. Should the approach be adjusted?\n5. What are the next priorities?\n\nUpdate the task file with your reflection, then continue working.",
+  "active": false,
+  "status": "completed",
+  "startedAt": "2026-07-24T23:20:42.434Z",
+  "completedAt": "2026-07-26T18:42:00.000Z",
+  "lastReflectionAt": 0,
+  "ownerSessionId": "019f950a-7836-75df-aea0-565883383b14"
+}
