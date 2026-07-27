@@ -143,6 +143,7 @@ struct ResourceInputs {
 
     // CPU topology
     int     total_core_groups  = 8;  // total physical core groups on system
+    int     pcore_count        = 0;  // number of P-core groups (rest are E-core)
 
     // Runnable tasks (from /proc/loadavg) — used as safety floor for hotplug
     int     running_tasks      = 0;  // tasks in runnable state

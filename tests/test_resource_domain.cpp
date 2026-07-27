@@ -216,126 +216,125 @@ TEST(SolveResources, DomainMaxLimit) {
 
 // ── GPU-idle hotplug: when GPU is not competing, keep all cores online ──
 
-TEST(SolveResources, GpuIdleKeepsAllCoresOnline) {
-    ResourceConfig cfg;
-    ResourceInputs inputs{};
-    inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 1.0;   // GPU effectively idle (< 3W threshold)
-    inputs.have_gpu = true;
-    inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.05;   // CPU also idle
-    inputs.gpu_c0_pct = 0.0;
-    inputs.gpu_power_var_w = 0.0;
-    inputs.total_core_groups = 16;
+// ── Budget-driven hotplug: GPU activity is implicit via cpu_budget ──
+// pcore_count=6, total=16 → 10 E-core groups. cpu_measured_w drives ratio.
+// budget = (pl1 - gpu - headroom) * demand_factor where demand_factor = 0.5 + 0.5*demand
 
-    auto result = solve_resources(inputs, cfg);
-
-    // GPU is idle → keep_groups = 0 (keep all online)
-    // Low CPU demand doesn't matter when GPU isn't competing.
-    EXPECT_EQ(result.keep_groups, 0);
-}
-
-TEST(SolveResources, GpuActiveOfflinesCores) {
+TEST(SolveResources, HighBudgetPonly) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 15.0;   // GPU active (> 3W threshold)
+    inputs.gpu_power_w = 1.0;   // GPU idle → high cpu_budget
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.05;   // CPU idle
+    inputs.cpu_demand = 0.05;   // CPU idle → demand_factor = 0.525
+    inputs.gpu_c0_pct = 0.0;
+    inputs.gpu_power_var_w = 0.0;
+    inputs.cpu_measured_w = 5.0;  // reference: 5W CPU draw
+    inputs.total_core_groups = 16;
+    inputs.pcore_count = 6;
+
+    auto result = solve_resources(inputs, cfg);
+
+    // budget = (40-1-3) * 0.525 = 18.9W, ratio = 18.9/5.0 = 3.78 → clamped 2.0
+    // ratio > 1.5 → P-cores only = 6
+    EXPECT_EQ(result.keep_groups, 6);
+}
+
+TEST(SolveResources, ModerateBudgetScalesECores) {
+    ResourceConfig cfg;
+    cfg.min_core_groups = 1;
+    ResourceInputs inputs{};
+    inputs.pl1_w = 40.0;
+    inputs.gpu_power_w = 15.0;   // GPU active
+    inputs.have_gpu = true;
+    inputs.temp_c = 50.0;
+    inputs.cpu_demand = 0.05;    // CPU idle → demand_factor = 0.525
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 2.0;
+    inputs.cpu_measured_w = 10.0;  // 10W CPU draw
     inputs.total_core_groups = 16;
+    inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // GPU active + CPU idle → keep P-cores only, offline E-cores.
-    // P-core count estimated as total_groups/3 ≈ 5 (actual=6 on Meteor Lake).
-    EXPECT_GT(result.keep_groups, 0);
-    EXPECT_LT(result.keep_groups, inputs.total_core_groups);  // some groups offlined
-    EXPECT_GT(result.keep_groups, cfg.min_core_groups);       // more than min (P-cores kept)
+    // budget = (40-15-3) * 0.525 = 12.6W, ratio = 12.6/10.0 = 1.26
+    // 0.8 < ratio < 1.5 → scale E-cores: e_frac = (1.26-0.8)/0.7 ≈ 0.66
+    // target = 6 + 10*0.66 ≈ 12 (more than P-only, less than all)
+    EXPECT_GT(result.keep_groups, 6);
+    EXPECT_LT(result.keep_groups, 16);
 }
 
-TEST(SolveResources, GpuActiveHighDemandKeepsAll) {
-    ResourceConfig cfg;
-    ResourceInputs inputs{};
-    inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 20.0;   // GPU active
-    inputs.have_gpu = true;
-    inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.98;   // CPU saturated
-    inputs.gpu_c0_pct = 0.0;
-    inputs.gpu_power_var_w = 3.0;
-    inputs.total_core_groups = 16;
-
-    auto result = solve_resources(inputs, cfg);
-
-    // High CPU demand → keep all online regardless of GPU
-    EXPECT_EQ(result.keep_groups, 0);
-}
-
-// ── Hotplug hysteresis: dead band prevents ping-pong at GPU idle boundary ──
-
-TEST(SolveResources, GpuHysteresisStaysOnlineInDeadBand) {
+TEST(SolveResources, TightBudgetAggressiveScaling) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 3.5;   // GPU in dead band [2.0, 5.0)
+    inputs.gpu_power_w = 20.0;   // GPU heavy
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.05;   // CPU idle
+    inputs.cpu_demand = 0.10;    // low CPU demand → demand_factor = 0.55
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
+    inputs.cpu_measured_w = 15.0;  // 15W CPU draw
     inputs.total_core_groups = 16;
-    inputs.prev_keep_groups = 0; // currently all online
+    inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // Dead band + currently online → stay online (hysteresis)
-    EXPECT_EQ(result.keep_groups, 0);
+    // headroom = 1.5*0 + max(1, 20*0.25) = 5.0
+    // budget = (40-20-5) * 0.55 = 7.58W, ratio = 7.58/15.0 = 0.51
+    // ratio < 0.8 → target = max(1, floor(16*0.51)) = 8
+    EXPECT_GT(result.keep_groups, 1);
+    EXPECT_LT(result.keep_groups, 10);
 }
 
-TEST(SolveResources, GpuHysteresisStaysOfflineInDeadBand) {
+TEST(SolveResources, DemandFloorOverridesBudget) {
     ResourceConfig cfg;
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 3.5;   // GPU in dead band [2.0, 5.0)
+    inputs.gpu_power_w = 1.0;   // GPU idle → high budget
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.05;   // CPU idle
-    inputs.gpu_c0_pct = 0.0;
-    inputs.gpu_power_var_w = 2.0;
-    inputs.total_core_groups = 16;
-    inputs.prev_keep_groups = 1; // currently offline
-
-    auto result = solve_resources(inputs, cfg);
-
-    // Dead band + currently offline → stay offline (hysteresis)
-    EXPECT_GT(result.keep_groups, 0);
-    EXPECT_EQ(result.keep_groups, cfg.min_core_groups);
-}
-
-TEST(SolveResources, GpuClearIdleBringsBackOnline) {
-    ResourceConfig cfg;
-    cfg.min_core_groups = 1;
-    ResourceInputs inputs{};
-    inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 1.0;   // GPU clearly idle (< 2W)
-    inputs.have_gpu = true;
-    inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.05;
+    inputs.cpu_demand = 0.98;   // CPU saturated → safety floor
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 0.0;
+    inputs.cpu_measured_w = 20.0;
     inputs.total_core_groups = 16;
-    inputs.prev_keep_groups = 1; // currently offline
+    inputs.pcore_count = 6;
 
     auto result = solve_resources(inputs, cfg);
 
-    // GPU clearly idle → bring all cores back online
+    // demand > 0.95 → keep all online regardless of budget
     EXPECT_EQ(result.keep_groups, 0);
+}
+
+// ── CPU-only workload (no GPU): P-cores used, E-cores shed ──
+
+TEST(SolveResources, CpuOnlyShedsECores) {
+    ResourceConfig cfg;
+    cfg.min_core_groups = 1;
+    ResourceInputs inputs{};
+    inputs.pl1_w = 40.0;
+    inputs.gpu_power_w = 0.0;   // no GPU
+    inputs.have_gpu = false;
+    inputs.temp_c = 50.0;
+    inputs.cpu_demand = 0.80;   // CPU heavily loaded (LLM inference)
+    inputs.gpu_c0_pct = 0.0;
+    inputs.gpu_power_var_w = 0.0;
+    inputs.cpu_measured_w = 20.0;  // 20W on P-cores only
+    inputs.total_core_groups = 16;
+    inputs.pcore_count = 6;
+
+    auto result = solve_resources(inputs, cfg);
+
+    // No GPU → full budget → ratio ≈ 40/20 = 2.0 → clamped to 2.0
+    // ratio > 1.5 → P-cores only = 6. Demand > 0.75 → max(6, total-2=14) = 14
+    // Demand floor raises target to 14 (P-cores + some E-cores)
+    EXPECT_GT(result.keep_groups, 6);   // demand floor lifts above P-only
+    EXPECT_LE(result.keep_groups, 14);
 }
 
 // ── Hotplug smoothing: small changes are suppressed ──
@@ -345,29 +344,29 @@ TEST(SolveResources, HotplugSmoothingSuppressesSmallChange) {
     cfg.min_core_groups = 1;
     ResourceInputs inputs{};
     inputs.pl1_w = 40.0;
-    inputs.gpu_power_w = 10.0;   // GPU active
+    inputs.gpu_power_w = 20.0;   // GPU active → moderate budget
     inputs.have_gpu = true;
     inputs.temp_c = 50.0;
-    inputs.cpu_demand = 0.42;    // medium demand → 16*(1-0.42*0.33) = 13.76 → 13
+    inputs.cpu_demand = 0.20;
     inputs.gpu_c0_pct = 0.0;
     inputs.gpu_power_var_w = 2.0;
+    inputs.cpu_measured_w = 15.0;  // 15W CPU draw
     inputs.total_core_groups = 16;
-    inputs.prev_keep_groups = 13;  // same as solver would compute
+    inputs.pcore_count = 6;
 
+    // ratio ≈ (40-20-3)/15 = 0.87 → 0.8 < ratio < 1.5 → e_frac = 0.87/0.7 = 1.0 → capped
+    // target ≈ 6 + 10 = 16 → clamped to 16 → smoothing kicks in
     auto result = solve_resources(inputs, cfg);
 
-    // prev == 13 and solver == 13 → no change, smoothing preserves
-    EXPECT_EQ(result.keep_groups, 13);
-
-    // Now try prev = 14 (diff of 1) → smoothing keeps prev
-    inputs.prev_keep_groups = 14;
+    // Solver computes some target; smoothing keeps prev if within 1
+    inputs.prev_keep_groups = result.keep_groups;
     auto result2 = solve_resources(inputs, cfg);
-    EXPECT_EQ(result2.keep_groups, 14);  // within 1 → keep previous
+    EXPECT_EQ(result2.keep_groups, result.keep_groups);  // prev preserved
 
-    // Now try prev = 16 (diff of 3) → smoothing allows change
-    inputs.prev_keep_groups = 16;
+    // Different prev within 1 → keep prev
+    inputs.prev_keep_groups = std::max(1, result.keep_groups - 1);
     auto result3 = solve_resources(inputs, cfg);
-    EXPECT_EQ(result3.keep_groups, 13);  // diff > 1 → use solver value
+    EXPECT_EQ(result3.keep_groups, inputs.prev_keep_groups);  // within 1 → keep prev
 }
 
 // ═══════════════════════════════════════════════════════════

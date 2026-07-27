@@ -1068,18 +1068,26 @@ int main(int argc, char** argv) {
         res_inputs.cpu_demand      = sched.effective_demand;
         res_inputs.running_tasks   = sched.running_tasks;
         res_inputs.total_core_groups = (int)s.cpu.core_groups.size();
+        res_inputs.pcore_count       = 0;
+        for (auto& g : s.cpu.core_groups) if (g.is_pcore) res_inputs.pcore_count++;
         res_inputs.cpu_domain_max_w = s.core.valid ? s.core.max_w() : 0.0;
 
         ResourceResult res = solve_resources(res_inputs, res_cfg);
 
         printf("PL1:           %.1fW\n", pl1_w);
         printf("GPU power:     %.1fW (snapshot)\n", res_inputs.gpu_power_w);
+        printf("CPU draw:      %.1fW (measured)\n", res_inputs.cpu_measured_w > 0 ? res_inputs.cpu_measured_w : res_inputs.pl1_w);
         printf("Demand:        %.2f\n", sched.effective_demand);
+        printf("P-core groups: %d (E-core: %d)\n",
+               res_inputs.pcore_count, res_inputs.total_core_groups - res_inputs.pcore_count);
         printf("Temperature:   %.0f°C\n", max_temp);
         printf("\nSolver would set:\n");
         printf("  cpu_target:      %.1fW\n", res.cpu_target_w);
         printf("  core_limit:      %.1fW\n", res.core_limit_w);
         printf("  gpu_headroom:    %.1fW\n", res.gpu_headroom_w);
+        double cpu_draw = res_inputs.cpu_measured_w > 0 ? res_inputs.cpu_measured_w : res.cpu_target_w;
+        double budget_ratio = (cpu_draw > 0) ? res.cpu_target_w / cpu_draw : 0;
+        printf("  budget_ratio:    %.2f (target/draw, >1.5→P-only, 0.8-1.5→scale E, <0.8→aggressive)\n", budget_ratio);
         printf("  max_perf_pct:    %d%%\n", res.max_perf_pct);
         printf("  no_turbo:        %s\n", res.no_turbo ? "ON" : "OFF");
         printf("  epp_p:           %s\n", epp_to_string(res.epp_p));
@@ -1334,6 +1342,8 @@ int main(int argc, char** argv) {
         res_inputs.cpu_measured_w   = core_w;
         res_inputs.cpu_domain_max_w = s.core.valid ? s.core.max_w() : 0.0;
         res_inputs.total_core_groups = (int)s.cpu.core_groups.size();
+        res_inputs.pcore_count       = 0;
+        for (auto& g : s.cpu.core_groups) if (g.is_pcore) res_inputs.pcore_count++;
         res_inputs.running_tasks     = sched.running_tasks;
         // Pass previous state for smoothing/hysteresis
         res_inputs.prev_max_perf    = prev_max_perf;
